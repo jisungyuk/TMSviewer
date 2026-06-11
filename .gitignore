@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Claude Code internal
+.claude/
+
+# LabChart data files (experiment-specific binary data)
+*.adicht
+
+# MATLAB binary
+reference/*.mlapp
+
+# External dependencies
+MAGIC-master/
