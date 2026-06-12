@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pythoncom
@@ -15,6 +16,13 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
+
+try:
+    import serial
+    from magstim_test import disable_remote, get_parameters, get_temperature
+    _SERIAL_AVAILABLE = True
+except ImportError:
+    _SERIAL_AVAILABLE = False
 
 from labchart_client import LabChartClient
 
@@ -40,6 +48,43 @@ TRIGGER_CH_IDX    = 7    # Ch8 "Channel 8" — TMS trigger signal (0-indexed)
 TRIGGER_THRESHOLD = 2.5  # V — rising above this = TMS fired
 TRIGGER_REFRACTORY = 0.5  # s — minimum gap between consecutive triggers
 
+MAGSTIM_PORT = "COM7"
+MAGSTIM_POLL_MS = 1000
+
+
+
+@dataclass
+class _Side:
+    """Per-channel (left/right) state and widget references."""
+    ch:    int
+    color: str
+    # per-trigger state
+    hunt_num:  int  = 0
+    hunt_den:  int  = 0
+    hunt_history:      list = field(default_factory=list)
+    hunt_latest_eval:  bool = True
+    table_latest_eval: bool = True
+    # y-axis state
+    yfix:  bool  = False
+    yhalf: float = 1.0
+    # plot overlay lists
+    vlines: list = field(default_factory=list)
+    shades: list = field(default_factory=list)
+    # widgets — assigned during _setup_ui
+    combo:       object = None
+    plot:        object = None
+    curve:       object = None
+    panel:       object = None
+    stats:       object = None
+    table:       object = None
+    hunt_panel:  object = None
+    hunt_chk:    object = None
+    hunt_num_lbl: object = None
+    hunt_den_lbl: object = None
+    hunt_clear:  object = None
+    hunt_redo:   object = None
+    btn_yfix:    object = None
+    btn_yauto:   object = None
 
 
 class _MaxSizeStack(QStackedWidget):
@@ -66,13 +111,13 @@ class _WheelSpinBox(QSpinBox):
 
 
 class RealTimeViewer(QMainWindow):
-    _tms_detected = pyqtSignal(object)  # emitted from COM background thread, carries (record, tick)
+    _tms_detected    = pyqtSignal(object)  # emitted from COM background thread, carries (record, tick)
+    _magstim_polled  = pyqtSignal(object)  # emitted from Magstim poll thread, carries params dict
 
     def __init__(self):
         super().__init__()
         pythoncom.CoInitialize()
         self.client        = None
-        self._event_sink   = None
         self._com_thread   = None
         self.is_running    = False
         self._start_time   = None
@@ -80,27 +125,17 @@ class RealTimeViewer(QMainWindow):
         self._next_trial_num = 1
         self._tms_detected.connect(self._on_tms_trigger)
         self.ch_info       = []
-        self.ch_left       = DEFAULT_CH_LEFT
-        self.ch_right      = DEFAULT_CH_RIGHT
+        self.L = _Side(ch=DEFAULT_CH_LEFT,  color=COLOR_LEFT)
+        self.R = _Side(ch=DEFAULT_CH_RIGHT, color=COLOR_RIGHT)
         self.trigger_times   = []
         self._last_trigger_t = None
         self.separate = False
-        self.hunt_num_val_left  = 0;  self.hunt_den_val_left  = 0
-        self.hunt_num_val_right = 0;  self.hunt_den_val_right = 0
-        self.hunt_history_left  = []  # list of (num, den) before each sample
-        self.hunt_history_right = []
-        self.hunt_latest_eval_left  = True
-        self.hunt_latest_eval_right = True
-        self.table_latest_eval_left  = True
-        self.table_latest_eval_right = True
-        self._yfix_left    = False
-        self._yfix_right   = False
-        self._yhalf_left   = 1.0
-        self._yhalf_right  = 1.0
-        self._vlines_left  = []
-        self._vlines_right = []
-        self._shades_left  = []
-        self._shades_right = []
+        self._magstim_mode = "SM"
+        self._magstim_port = None
+        self._magstim_stop = threading.Event()
+        self._magstim_last_poll_t = 0.0
+        self._mso1_val = 0
+        self._magstim_polled.connect(self._on_magstim_polled)
         self.window_secs   = WINDOW_SECS_DEFAULT
         self.scope_pre     = SCOPE_PRE_DEFAULT
         self.scope_post    = SCOPE_POST_DEFAULT
@@ -110,6 +145,7 @@ class RealTimeViewer(QMainWindow):
         pg.setConfigOption("foreground", "k")
 
         self._setup_ui()
+        self._connect_magstim()
 
         self.data_timer = QTimer()
         self.data_timer.timeout.connect(self._update)
@@ -127,6 +163,29 @@ class RealTimeViewer(QMainWindow):
         self.setWindowTitle("TMSviewer")
         self.setMinimumSize(1800, 1013)
 
+        central = self._make_central_widget()
+        self.setCentralWidget(central)
+
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        root.addLayout(self._make_mode_row())
+        root.addWidget(self._make_analysis_stack())
+        root.addLayout(self._make_channel_row())
+        root.addLayout(self._make_plots_row(), stretch=1)
+        root.addWidget(self._make_scope_below_stack())
+
+        self.lbl_status = QLabel("Connecting to LabChart...")
+        self.lbl_status.setAlignment(Qt.AlignCenter)
+        _sf = QFont(); _sf.setPointSize(10)
+        self.lbl_status.setFont(_sf)
+        root.addWidget(self.lbl_status)
+
+        root.addLayout(self._make_btn_row())
+        self._on_mode_changed()
+
+    def _make_central_widget(self):
         central = QWidget()
         central.setStyleSheet("""
             background-color: white;
@@ -141,9 +200,6 @@ class RealTimeViewer(QMainWindow):
             QPushButton:disabled { background-color: #d0d0d0; color: #aaa; }
             QPushButton:checked { background-color: #787878; }
         """)
-        self.setCentralWidget(central)
-
-        # Scale default (unsized) font by 10%
         _app_font = QApplication.font()
         _pt = _app_font.pointSize()
         if _pt > 0:
@@ -154,12 +210,9 @@ class RealTimeViewer(QMainWindow):
             _scaled = QFont(_app_font)
             _scaled.setPixelSize(round(_app_font.pixelSize() * 1.1))
             central.setFont(_scaled)
+        return central
 
-        root = QVBoxLayout(central)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
-
-        # ── Mode selector row ───────────────────────────────────────────
+    def _make_mode_row(self):
         mode_row = QHBoxLayout()
         mode_row.setSpacing(12)
 
@@ -176,7 +229,6 @@ class RealTimeViewer(QMainWindow):
         mode_row.addWidget(self.radio_scope)
         mode_row.addSpacing(20)
 
-        # Chart params (window size)
         self.widget_chart_params = QWidget()
         chart_p = QHBoxLayout(self.widget_chart_params)
         chart_p.setContentsMargins(0, 0, 0, 0)
@@ -195,7 +247,6 @@ class RealTimeViewer(QMainWindow):
         chart_p.addWidget(btn_chart_apply)
         mode_row.addWidget(self.widget_chart_params)
 
-        # Scope params (pre / post trigger)
         self.widget_scope_params = QWidget()
         scope_p = QHBoxLayout(self.widget_scope_params)
         scope_p.setContentsMargins(0, 0, 0, 0)
@@ -224,9 +275,9 @@ class RealTimeViewer(QMainWindow):
         mode_row.addWidget(self.widget_scope_params)
 
         mode_row.addStretch()
-        root.addLayout(mode_row)
+        return mode_row
 
-        # ── Analysis row — radio buttons only ───────────────────────────
+    def _make_analysis_stack(self):
         w_scope_analysis = QWidget()
         analysis_row = QHBoxLayout(w_scope_analysis)
         analysis_row.setContentsMargins(0, 0, 0, 0)
@@ -246,60 +297,25 @@ class RealTimeViewer(QMainWindow):
         analysis_row.addStretch()
 
         self.stack_analysis = _MaxSizeStack()
-        self.stack_analysis.addWidget(w_scope_analysis)  # index 0: scope
-        self.stack_analysis.addWidget(QWidget())          # index 1: chart
-        root.addWidget(self.stack_analysis)
+        self.stack_analysis.addWidget(w_scope_analysis)
+        self.stack_analysis.addWidget(QWidget())
+        return self.stack_analysis
 
-        # MEP param spinboxes — placed in centre column (built here, inserted below)
-        self.spin_mep_start = QSpinBox()
-        self.spin_mep_start.setRange(1, 500)
-        self.spin_mep_start.setValue(10)
-
-        self.spin_mep_end = QSpinBox()
-        self.spin_mep_end.setRange(1, 500)
-        self.spin_mep_end.setValue(50)
-        self.spin_mep_end.setSuffix(" ms")
-
-        self.spin_threshold = QDoubleSpinBox()
-        self.spin_threshold.setRange(0.01, 100)
-        self.spin_threshold.setSingleStep(0.01)
-        self.spin_threshold.setDecimals(2)
-        self.spin_threshold.setValue(0.05)
-        self.spin_threshold.setSuffix(" mV")
-
-        self.spin_prestim_start = QSpinBox()
-        self.spin_prestim_start.setRange(-1000, -1)
-        self.spin_prestim_start.setValue(-200)
-
-        self.spin_prestim_end = QSpinBox()
-        self.spin_prestim_end.setRange(-500, -1)
-        self.spin_prestim_end.setValue(-50)
-        self.spin_prestim_end.setSuffix(" ms")
-
-        # ── Channel dropdowns ───────────────────────────────────────────
+    def _make_channel_row(self):
         combos_row = QHBoxLayout()
         combos_row.setSpacing(8)
-        self.combo_left  = QComboBox()
-        self.combo_right = QComboBox()
-        self.combo_left.currentIndexChanged.connect(self._on_combo_left)
-        self.combo_right.currentIndexChanged.connect(self._on_combo_right)
+        self.L.combo = QComboBox()
+        self.R.combo = QComboBox()
+        self.L.combo.currentIndexChanged.connect(lambda idx: self._on_combo("left",  idx))
+        self.R.combo.currentIndexChanged.connect(lambda idx: self._on_combo("right", idx))
         combos_row.addWidget(QLabel("Left channel:"))
-        combos_row.addWidget(self.combo_left, stretch=1)
-        combos_row.addSpacing(150)   # matches centre column width
+        combos_row.addWidget(self.L.combo, stretch=1)
+        combos_row.addSpacing(150)
         combos_row.addWidget(QLabel("Right channel:"))
-        combos_row.addWidget(self.combo_right, stretch=1)
-        root.addLayout(combos_row)
+        combos_row.addWidget(self.R.combo, stretch=1)
+        return combos_row
 
-        # ── Two plots + trigger list in the middle ──────────────────────
-        plots_row = QHBoxLayout()
-        plots_row.setSpacing(8)
-
-        self.plot_left  = self._make_plot("Left EMG",  COLOR_LEFT)
-        self.plot_right = self._make_plot("Right EMG", COLOR_RIGHT)
-        self.curve_left  = self.plot_left.plot(pen=pg.mkPen(COLOR_LEFT,  width=1))
-        self.curve_right = self.plot_right.plot(pen=pg.mkPen(COLOR_RIGHT, width=1))
-
-        # Centre column — trigger counter + MEP params
+    def _make_centre_column(self):
         self.centre_widget = QWidget()
         centre = QVBoxLayout(self.centre_widget)
         centre.setSpacing(4)
@@ -321,7 +337,6 @@ class RealTimeViewer(QMainWindow):
         centre.addWidget(self.trigger_spin)
         centre.addSpacing(12)
 
-        # MEP params set 1 (left graph always)
         self.lbl_arrow_1 = QLabel("<--->")
         self.lbl_arrow_1.setAlignment(Qt.AlignCenter)
         arrow_font = QFont()
@@ -343,7 +358,6 @@ class RealTimeViewer(QMainWindow):
         centre.addWidget(self.btn_separate)
         centre.addSpacing(6)
 
-        # MEP params set 2 (right graph — always visible, enabled only when Separate is ON)
         self.lbl_arrow_2 = QLabel("--->")
         self.lbl_arrow_2.setAlignment(Qt.AlignCenter)
         self.lbl_arrow_2.setFont(arrow_font)
@@ -358,29 +372,116 @@ class RealTimeViewer(QMainWindow):
         self.widget_mep_params_2.setGraphicsEffect(self._fx_params_2)
 
         centre.addStretch()
+        return self.centre_widget
 
-        self.panel_left,  self.stats_left  = self._make_side_panel("left")
-        self.panel_right, self.stats_right = self._make_side_panel("right")
+    def _make_plots_row(self):
+        self.L.plot  = self._make_plot("Left EMG",  COLOR_LEFT)
+        self.R.plot  = self._make_plot("Right EMG", COLOR_RIGHT)
+        self.L.curve = self.L.plot.plot(pen=pg.mkPen(COLOR_LEFT,  width=1))
+        self.R.curve = self.R.plot.plot(pen=pg.mkPen(COLOR_RIGHT, width=1))
+
+        # _make_side_panel assigns s.panel, s.stats, s.btn_yfix, s.btn_yauto into self.L / self.R
+        self._make_side_panel("left")
+        self._make_side_panel("right")
 
         self.stack_centre = _MaxSizeStack()
         self.stack_centre.setFixedWidth(135)
-        self.stack_centre.addWidget(self.centre_widget)  # index 0: scope
-        self.stack_centre.addWidget(QWidget())            # index 1: chart
+        self.stack_centre.addWidget(self._make_centre_column())
+        self.stack_centre.addWidget(QWidget())
 
-        plots_row.addWidget(self.panel_left)
-        plots_row.addWidget(self.plot_left,  stretch=1)
+        plots_row = QHBoxLayout()
+        plots_row.setSpacing(8)
+        plots_row.addWidget(self.L.panel)
+        plots_row.addWidget(self.L.plot,  stretch=1)
         plots_row.addWidget(self.stack_centre)
-        plots_row.addWidget(self.plot_right, stretch=1)
-        plots_row.addWidget(self.panel_right)
-        root.addLayout(plots_row, stretch=1)
+        plots_row.addWidget(self.R.plot,  stretch=1)
+        plots_row.addWidget(self.R.panel)
+        return plots_row
 
-        # ── Scope-only bottom section (stacked with chart page) ─────────
+    def _make_mso_row(self):
+        mso_row  = QHBoxLayout()
+        mso_row.setSpacing(12)
+        mso_font  = QFont(); mso_font.setPointSize(18)
+        btn_font  = QFont(); btn_font.setPointSize(16)
+        mode_font = QFont(); mode_font.setPointSize(18); mode_font.setBold(True)
+
+        mso_row.addStretch(1)
+
+        self.btn_sm = QPushButton("SM"); self.btn_sm.setFont(mode_font)
+        self.btn_sm.setFixedWidth(64)
+        self.btn_sm.setStyleSheet("background-color: #1565C0; color: white;")
+        self.btn_sm.clicked.connect(self._on_sm_clicked)
+        mso_row.addWidget(self.btn_sm)
+        self.btn_dm = QPushButton("DM"); self.btn_dm.setFont(mode_font)
+        self.btn_dm.setFixedWidth(64)
+        self.btn_dm.clicked.connect(self._on_dm_clicked)
+        mso_row.addWidget(self.btn_dm)
+        dot_font = QFont(); dot_font.setPointSize(15)
+        self.lbl_magstim_dot = QLabel("●"); self.lbl_magstim_dot.setFont(dot_font)
+        self.lbl_magstim_dot.setStyleSheet("color: #aaaaaa;")
+        self.lbl_magstim_dot.setToolTip(MAGSTIM_PORT)
+        mso_row.addWidget(self.lbl_magstim_dot)
+        status_font = QFont(); status_font.setPointSize(13); status_font.setBold(True)
+        self.lbl_magstim_state = QLabel("—"); self.lbl_magstim_state.setFont(status_font)
+        self.lbl_magstim_state.setStyleSheet("color: #aaaaaa;")
+        mso_row.addWidget(self.lbl_magstim_state)
+        temp_font = QFont(); temp_font.setPointSize(13)
+        self.lbl_magstim_temp = QLabel("—"); self.lbl_magstim_temp.setFont(temp_font)
+        self.lbl_magstim_temp.setToolTip("Coil temp unavailable")
+        mso_row.addWidget(self.lbl_magstim_temp)
+        mso_row.addSpacing(8)
+
+        lbl_mso1 = QLabel("MSO1:"); lbl_mso1.setFont(mso_font)
+        mso_row.addWidget(lbl_mso1)
+        self.lbl_mso_val = QLabel("—"); self.lbl_mso_val.setFont(mso_font)
+        self.lbl_mso_val.setMinimumWidth(45)
+        mso_row.addWidget(self.lbl_mso_val)
+        mso_row.addSpacing(16)
+
+        self.lbl_mso2 = QLabel("MSO2:"); self.lbl_mso2.setFont(mso_font)
+        self.lbl_mso2.setEnabled(False)
+        mso_row.addWidget(self.lbl_mso2)
+        self.lbl_mso2_val = QLabel("—"); self.lbl_mso2_val.setFont(mso_font)
+        self.lbl_mso2_val.setMinimumWidth(45)
+        self.lbl_mso2_val.setEnabled(False)
+        mso_row.addWidget(self.lbl_mso2_val)
+
+        isi_font = QFont(); isi_font.setPointSize(13)
+        self.lbl_ipi = QLabel("  ISI:"); self.lbl_ipi.setFont(isi_font)
+        self.lbl_ipi.setEnabled(False)
+        mso_row.addWidget(self.lbl_ipi)
+        self.lbl_isi_val = QLabel("—"); self.lbl_isi_val.setFont(isi_font)
+        self.lbl_isi_val.setEnabled(False)
+        self.lbl_isi_val.setMinimumWidth(80)
+        mso_row.addWidget(self.lbl_isi_val)
+        mso_row.addSpacing(16)
+
+        lbl_loc = QLabel("Loc ID:"); lbl_loc.setFont(mso_font)
+        mso_row.addWidget(lbl_loc)
+        self.spin_location = _WheelSpinBox()
+        self.spin_location.setRange(1, 9999); self.spin_location.setValue(1)
+        self.spin_location.setFixedWidth(100); self.spin_location.setFont(mso_font)
+        self.spin_location.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
+        mso_row.addWidget(self.spin_location)
+
+        mso_row.addStretch(1)
+        btn_new_best = QPushButton("New Best"); btn_new_best.setFont(btn_font)
+        btn_new_best.clicked.connect(self._on_new_best)
+        mso_row.addWidget(btn_new_best)
+        btn_equal_best = QPushButton("Equal Best"); btn_equal_best.setFont(btn_font)
+        btn_equal_best.clicked.connect(self._on_equal_best)
+        mso_row.addWidget(btn_equal_best)
+        self.combo_best = QComboBox(); self.combo_best.setFont(btn_font)
+        self.combo_best.setMinimumWidth(180)
+        mso_row.addWidget(self.combo_best)
+        return mso_row
+
+    def _make_scope_below_stack(self):
         w_scope_below = QWidget()
         scope_vbox = QVBoxLayout(w_scope_below)
         scope_vbox.setContentsMargins(0, 0, 0, 0)
         scope_vbox.setSpacing(8)
 
-        # Hunt row
         hunt_row = QHBoxLayout()
         hunt_row.setSpacing(8)
         hunt_row.addSpacing(81)
@@ -393,83 +494,41 @@ class RealTimeViewer(QMainWindow):
         sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setFrameShadow(QFrame.Sunken)
         scope_vbox.addWidget(sep)
 
-        # MSO / Location row
-        mso_row = QHBoxLayout()
-        mso_row.setSpacing(12)
-        mso_font = QFont(); mso_font.setPointSize(23)
-        btn_font = QFont(); btn_font.setPointSize(16)
-
-        mso_row.addStretch(1)
-        lbl_mso = QLabel("MSO %:"); lbl_mso.setFont(mso_font)
-        mso_row.addWidget(lbl_mso)
-        self.spin_mso = _WheelSpinBox()
-        self.spin_mso.setRange(0, 100); self.spin_mso.setValue(0)
-        self.spin_mso.setFixedWidth(81); self.spin_mso.setFont(mso_font)
-        self.spin_mso.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        mso_row.addWidget(self.spin_mso)
-        mso_row.addSpacing(32)
-        lbl_loc = QLabel("Location ID:"); lbl_loc.setFont(mso_font)
-        mso_row.addWidget(lbl_loc)
-        self.spin_location = _WheelSpinBox()
-        self.spin_location.setRange(0, 9999); self.spin_location.setValue(0)
-        self.spin_location.setFixedWidth(81); self.spin_location.setFont(mso_font)
-        self.spin_location.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        mso_row.addWidget(self.spin_location)
-        mso_row.addStretch(1)
-        btn_new_best = QPushButton("New Best"); btn_new_best.setFont(btn_font)
-        btn_new_best.clicked.connect(self._on_new_best)
-        mso_row.addWidget(btn_new_best)
-        btn_equal_best = QPushButton("Equal Best"); btn_equal_best.setFont(btn_font)
-        btn_equal_best.clicked.connect(self._on_equal_best)
-        mso_row.addWidget(btn_equal_best)
-        self.combo_best = QComboBox(); self.combo_best.setFont(btn_font)
-        self.combo_best.setMinimumWidth(180)
-        mso_row.addWidget(self.combo_best)
-        scope_vbox.addLayout(mso_row)
+        scope_vbox.addLayout(self._make_mso_row())
 
         sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine); sep2.setFrameShadow(QFrame.Sunken)
         scope_vbox.addWidget(sep2)
 
-        # Data tables
         tables_row = QHBoxLayout(); tables_row.setSpacing(8)
-        self.table_left  = self._make_data_table()
-        self.table_right = self._make_data_table()
+        self.L.table = self._make_data_table()
+        self.R.table = self._make_data_table()
         btn_save = QPushButton("Save"); btn_save.setFixedWidth(130)
         btn_save.clicked.connect(self._save_tables)
         tables_row.addSpacing(81)
-        tables_row.addWidget(self.table_left,  stretch=1)
+        tables_row.addWidget(self.L.table, stretch=1)
         tables_row.addWidget(btn_save, alignment=Qt.AlignCenter)
-        tables_row.addWidget(self.table_right, stretch=1)
+        tables_row.addWidget(self.R.table, stretch=1)
         tables_row.addSpacing(81)
         scope_vbox.addLayout(tables_row)
 
         self.stack_below = _MaxSizeStack()
-        self.stack_below.addWidget(w_scope_below)  # index 0: scope
-        self.stack_below.addWidget(QWidget())       # index 1: chart
-        root.addWidget(self.stack_below)
+        self.stack_below.addWidget(w_scope_below)
+        self.stack_below.addWidget(QWidget())
+        return self.stack_below
 
-        # ── LabChart status label ───────────────────────────────────────
-        self.lbl_status = QLabel("Connecting to LabChart...")
-        self.lbl_status.setAlignment(Qt.AlignCenter)
-        f = QFont()
-        f.setPointSize(10)
-        self.lbl_status.setFont(f)
-        root.addWidget(self.lbl_status)
-
-        # ── Play / Stop + Sample buttons ───────────────────────────────
+    def _make_btn_row(self):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-        f2 = QFont()
-        f2.setPointSize(13)
+        _bf = QFont(); _bf.setPointSize(13)
 
         self.btn = QPushButton("▶  Play")
         self.btn.setFixedHeight(43)
-        self.btn.setFont(f2)
+        self.btn.setFont(_bf)
         self.btn.clicked.connect(self._toggle)
 
         self.btn_sample = QPushButton("Sample")
         self.btn_sample.setFixedHeight(43)
-        self.btn_sample.setFont(f2)
+        self.btn_sample.setFont(_bf)
         self.btn_sample.setEnabled(False)
         self.btn_sample.setStyleSheet(
             "QPushButton:enabled  { background-color: #2e7d32; color: white; }"
@@ -479,9 +538,7 @@ class RealTimeViewer(QMainWindow):
 
         btn_row.addWidget(self.btn, stretch=1)
         btn_row.addWidget(self.btn_sample, stretch=1)
-        root.addLayout(btn_row)
-
-        self._on_mode_changed()
+        return btn_row
 
     def _make_mep_params_widget(self, second=False):
         widget = QWidget()
@@ -564,24 +621,15 @@ class RealTimeViewer(QMainWindow):
         layout.addWidget(btn_redo)
         layout.addStretch()
 
-        if side == "left":
-            self.hunt_panel_left  = panel
-            self.hunt_chk_left    = chk
-            self.hunt_num_left    = lbl_num
-            self.hunt_den_left    = lbl_den
-            self.hunt_clear_left  = btn_clear
-            self.hunt_redo_left   = btn_redo
-            btn_clear.clicked.connect(lambda: self._on_hunt_clear("left"))
-            btn_redo.clicked.connect(lambda: self._on_hunt_redo("left"))
-        else:
-            self.hunt_panel_right = panel
-            self.hunt_chk_right   = chk
-            self.hunt_num_right   = lbl_num
-            self.hunt_den_right   = lbl_den
-            self.hunt_clear_right = btn_clear
-            self.hunt_redo_right  = btn_redo
-            btn_clear.clicked.connect(lambda: self._on_hunt_clear("right"))
-            btn_redo.clicked.connect(lambda: self._on_hunt_redo("right"))
+        s = self.L if side == "left" else self.R
+        s.hunt_panel  = panel
+        s.hunt_chk    = chk
+        s.hunt_num_lbl = lbl_num
+        s.hunt_den_lbl = lbl_den
+        s.hunt_clear  = btn_clear
+        s.hunt_redo   = btn_redo
+        btn_clear.clicked.connect(lambda: self._on_hunt_clear(side))
+        btn_redo.clicked.connect(lambda: self._on_hunt_redo(side))
 
         outer = QHBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)
@@ -611,12 +659,12 @@ class RealTimeViewer(QMainWindow):
             return "\n".join(lines)
 
         with open(path, "w", encoding="utf-8") as f:
-            f.write(table_to_text(self.table_left,  "=== Left EMG ==="))
+            f.write(table_to_text(self.L.table, "=== Left EMG ==="))
             f.write("\n\n")
-            f.write(table_to_text(self.table_right, "=== Right EMG ==="))
+            f.write(table_to_text(self.R.table, "=== Right EMG ==="))
 
     def _make_data_table(self):
-        cols = ["Channel", "Loc ID", "%MSO", "Trial", "MEP amp", "Prestim RMS"]
+        cols = ["Channel", "Loc ID", "%MSO1", "Trial", "MEP amp", "Prestim RMS"]
         tbl = QTableWidget(0, len(cols))
         tbl.setHorizontalHeaderLabels(cols)
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -670,82 +718,57 @@ class RealTimeViewer(QMainWindow):
         vbox.addWidget(stats)
         vbox.addStretch()
 
-        if side == "left":
-            self._btn_yfix_left  = btn_fix
-            self._btn_yauto_left = btn_auto
-            btn_plus.clicked.connect(lambda: self._yzoom("left", 1 / 1.25))
-            btn_minus.clicked.connect(lambda: self._yzoom("left", 1.25))
-            btn_fix.clicked.connect(lambda: self._yfix_clicked("left"))
-            btn_auto.clicked.connect(lambda: self._yauto_clicked("left"))
-        else:
-            self._btn_yfix_right  = btn_fix
-            self._btn_yauto_right = btn_auto
-            btn_plus.clicked.connect(lambda: self._yzoom("right", 1 / 1.25))
-            btn_minus.clicked.connect(lambda: self._yzoom("right", 1.25))
-            btn_fix.clicked.connect(lambda: self._yfix_clicked("right"))
-            btn_auto.clicked.connect(lambda: self._yauto_clicked("right"))
-
-        return outer, stats
+        s = self.L if side == "left" else self.R
+        s.btn_yfix  = btn_fix
+        s.btn_yauto = btn_auto
+        s.panel = outer
+        s.stats = stats
+        btn_plus.clicked.connect(lambda: self._yzoom(side, 1 / 1.25))
+        btn_minus.clicked.connect(lambda: self._yzoom(side, 1.25))
+        btn_fix.clicked.connect(lambda: self._yfix_clicked(side))
+        btn_auto.clicked.connect(lambda: self._yauto_clicked(side))
 
     # ------------------------------------------------------------------
     # Y-axis zoom / fix / auto
     # ------------------------------------------------------------------
 
     def _yzoom(self, side, factor):
-        if side == "left":
-            plot = self.plot_left
-            if not self._yfix_left:
-                vr = plot.viewRange()
-                self._yhalf_left = max(abs(vr[1][0]), abs(vr[1][1]), 1e-6)
-                self._yfix_left = True
-                self._btn_yfix_left.setChecked(True)
-                self._btn_yauto_left.setChecked(False)
-            self._yhalf_left = max(self._yhalf_left * factor, 1e-6)
-            plot.enableAutoRange(axis="y", enable=False)
-            plot.setYRange(-self._yhalf_left, self._yhalf_left, padding=0)
-        else:
-            plot = self.plot_right
-            if not self._yfix_right:
-                vr = plot.viewRange()
-                self._yhalf_right = max(abs(vr[1][0]), abs(vr[1][1]), 1e-6)
-                self._yfix_right = True
-                self._btn_yfix_right.setChecked(True)
-                self._btn_yauto_right.setChecked(False)
-            self._yhalf_right = max(self._yhalf_right * factor, 1e-6)
-            plot.enableAutoRange(axis="y", enable=False)
-            plot.setYRange(-self._yhalf_right, self._yhalf_right, padding=0)
+        s = self.L if side == "left" else self.R
+        if not s.yfix:
+            vr = s.plot.viewRange()
+            s.yhalf = max(abs(vr[1][0]), abs(vr[1][1]), 1e-6)
+            s.yfix = True
+            s.btn_yfix.setChecked(True)
+            s.btn_yauto.setChecked(False)
+        s.yhalf = max(s.yhalf * factor, 1e-6)
+        s.plot.enableAutoRange(axis="y", enable=False)
+        s.plot.setYRange(-s.yhalf, s.yhalf, padding=0)
 
     def _yfix_clicked(self, side):
-        if side == "left":
-            vr = self.plot_left.viewRange()
-            self._yhalf_left = max(abs(vr[1][0]), abs(vr[1][1]), 1e-6)
-            self._yfix_left = True
-            self._btn_yfix_left.setChecked(True)
-            self._btn_yauto_left.setChecked(False)
-            self.plot_left.enableAutoRange(axis="y", enable=False)
-            self.plot_left.setYRange(-self._yhalf_left, self._yhalf_left, padding=0)
-        else:
-            vr = self.plot_right.viewRange()
-            self._yhalf_right = max(abs(vr[1][0]), abs(vr[1][1]), 1e-6)
-            self._yfix_right = True
-            self._btn_yfix_right.setChecked(True)
-            self._btn_yauto_right.setChecked(False)
-            self.plot_right.enableAutoRange(axis="y", enable=False)
-            self.plot_right.setYRange(-self._yhalf_right, self._yhalf_right, padding=0)
+        s = self.L if side == "left" else self.R
+        vr = s.plot.viewRange()
+        s.yhalf = max(abs(vr[1][0]), abs(vr[1][1]), 1e-6)
+        s.yfix = True
+        s.btn_yfix.setChecked(True)
+        s.btn_yauto.setChecked(False)
+        s.plot.enableAutoRange(axis="y", enable=False)
+        s.plot.setYRange(-s.yhalf, s.yhalf, padding=0)
 
     def _yauto_clicked(self, side):
-        if side == "left":
-            self._yfix_left = False
-            self._btn_yfix_left.setChecked(False)
-            self._btn_yauto_left.setChecked(True)
-        else:
-            self._yfix_right = False
-            self._btn_yfix_right.setChecked(False)
-            self._btn_yauto_right.setChecked(True)
+        s = self.L if side == "left" else self.R
+        s.yfix = False
+        s.btn_yfix.setChecked(False)
+        s.btn_yauto.setChecked(True)
 
     # ------------------------------------------------------------------
 
-    def _update_stats(self, lbl, arr, t_start, trigger_t, t_scale, second=False):
+    def _analyse_epoch(self, arr, second=False):
+        """Compute MEP amplitude and prestim RMS for one epoch array.
+
+        Returns {"mep_amp": float, "prestim_rms": float}, or None if arr is empty.
+        """
+        if arr is None or len(arr) == 0:
+            return None
         if second:
             mep_s = self.spin_mep_start_2.value()     / 1000.0
             mep_e = self.spin_mep_end_2.value()       / 1000.0
@@ -756,31 +779,24 @@ class RealTimeViewer(QMainWindow):
             mep_e = self.spin_mep_end.value()       / 1000.0
             pre_s = self.spin_prestim_start.value() / 1000.0
             pre_e = self.spin_prestim_end.value()   / 1000.0
+        n     = len(arr)
+        dur   = self.scope_pre + self.scope_post
+        spt   = dur / max(n - 1, 1)
+        t_rel = np.arange(n) * spt - self.scope_pre
+        mep_data = arr[(t_rel >= mep_s) & (t_rel <= mep_e)]
+        pre_data = arr[(t_rel >= pre_s) & (t_rel <= pre_e)]
+        mep_amp     = float(np.nanmax(mep_data) - np.nanmin(mep_data)) if mep_data.size > 0 else 0.0
+        prestim_rms = float(np.sqrt(np.nanmean(pre_data ** 2)))        if pre_data.size > 0 else 0.0
+        return {"mep_amp": mep_amp, "prestim_rms": prestim_rms}
 
-        n       = len(arr)
-        dur     = self.scope_pre + self.scope_post
-        spt     = dur / max(n - 1, 1)
-        t_rel   = np.arange(n) * spt - self.scope_pre  # seconds relative to trigger
-
-        mep_mask = (t_rel >= mep_s) & (t_rel <= mep_e)
-        pre_mask = (t_rel >= pre_s) & (t_rel <= pre_e)
-
-        mep_data = arr[mep_mask]
-        pre_data = arr[pre_mask]
-
-        if mep_data.size > 0:
-            mep_amp = float(np.nanmax(mep_data) - np.nanmin(mep_data))
-            mep_str = f"{mep_amp:.3f} mV"
-        else:
-            mep_str = "—"
-
-        if pre_data.size > 0:
-            rms = float(np.sqrt(np.nanmean(pre_data ** 2)))
-            rms_str = f"{rms:.3f} mV"
-        else:
-            rms_str = "—"
-
-        lbl.setText(f"Prestim RMS\n{rms_str}\n\nMEP amp\n{mep_str}")
+    def _update_stats(self, lbl, arr, second=False):
+        r = self._analyse_epoch(arr, second)
+        if r is None:
+            lbl.setText("Prestim RMS\n—\n\nMEP amp\n—")
+            return
+        lbl.setText(
+            f"Prestim RMS\n{r['prestim_rms']:.3f} mV\n\nMEP amp\n{r['mep_amp']:.3f} mV"
+        )
 
     def _make_plot(self, title, color):
         plot = pg.PlotWidget()
@@ -807,14 +823,9 @@ class RealTimeViewer(QMainWindow):
         self.stack_analysis.setCurrentIndex(page)
         self.stack_centre.setCurrentIndex(page)
         self.stack_below.setCurrentIndex(page)
-        self.panel_left.setVisible(not chart)
-        self.panel_right.setVisible(not chart)
-        if chart:
-            self.plot_left.enableAutoRange(axis="y", enable=True)
-            self.plot_right.enableAutoRange(axis="y", enable=True)
-        else:
-            self.plot_left.enableAutoRange(axis="y", enable=False)
-            self.plot_right.enableAutoRange(axis="y", enable=False)
+        for s in (self.L, self.R):
+            s.panel.setVisible(not chart)
+            s.plot.enableAutoRange(axis="y", enable=chart)
         self.widget_chart_params.setVisible(chart)
         self.widget_scope_params.setVisible(not chart)
         self.trigger_spin.setEnabled(not chart)
@@ -822,21 +833,17 @@ class RealTimeViewer(QMainWindow):
         self.radio_none.setEnabled(not chart)
         self.radio_mep.setEnabled(not chart)
         mep_active = (not chart) and self.radio_mep.isChecked()
-        self.hunt_panel_left.setEnabled(mep_active)
-        self.hunt_panel_right.setEnabled(mep_active)
+        for s in (self.L, self.R):
+            s.hunt_panel.setEnabled(mep_active)
 
         x_label = "Time (s)" if chart else "Time from trigger (s)"
-        self.plot_left.setLabel("bottom",  x_label)
-        self.plot_right.setLabel("bottom", x_label)
-
-        # Clear plots on mode switch
-        self.curve_left.setData([], [])
-        self.curve_right.setData([], [])
+        for s in (self.L, self.R):
+            s.plot.setLabel("bottom", x_label)
+            s.curve.setData([], [])
         self._clear_trigger_lines()
 
-        # Scope로 돌아올 때 즉시 재그리기 (data_timer 상태와 무관하게)
         if not chart and self.trigger_times:
-            channels = list({self.ch_left, self.ch_right})
+            channels = list({self.L.ch, self.R.ch})
             self._update_scope(channels, selected_row=self.trigger_spin.value() - 1)
 
     # ------------------------------------------------------------------
@@ -846,51 +853,15 @@ class RealTimeViewer(QMainWindow):
     def _on_analysis_mode_changed(self):
         mep = self.radio_mep.isChecked()
         self.widget_mep_params.setEnabled(mep)
-        self.hunt_panel_left.setEnabled(mep)
-        self.hunt_panel_right.setEnabled(mep)
+        for s in (self.L, self.R):
+            s.hunt_panel.setEnabled(mep)
         if self.radio_scope.isChecked():
-            channels = [self.ch_left, self.ch_right]
-            self._update_scope(channels)
+            self._update_scope([self.L.ch, self.R.ch])
 
     def _update_hunt_display(self, side):
-        if side == "left":
-            self.hunt_num_left.setText(str(self.hunt_num_val_left))
-            self.hunt_den_left.setText(str(self.hunt_den_val_left))
-        else:
-            self.hunt_num_right.setText(str(self.hunt_num_val_right))
-            self.hunt_den_right.setText(str(self.hunt_den_val_right))
-
-    def _compute_mep_amp(self, arr, second=False):
-        if second:
-            mep_s = self.spin_mep_start_2.value() / 1000.0
-            mep_e = self.spin_mep_end_2.value()   / 1000.0
-        else:
-            mep_s = self.spin_mep_start.value() / 1000.0
-            mep_e = self.spin_mep_end.value()   / 1000.0
-        n     = len(arr)
-        dur   = self.scope_pre + self.scope_post
-        spt   = dur / max(n - 1, 1)
-        t_rel = np.arange(n) * spt - self.scope_pre
-        mep_data = arr[(t_rel >= mep_s) & (t_rel <= mep_e)]
-        if mep_data.size > 0:
-            return float(np.nanmax(mep_data) - np.nanmin(mep_data))
-        return 0.0
-
-    def _compute_prestim_rms(self, arr, second=False):
-        if second:
-            pre_s = self.spin_prestim_start_2.value() / 1000.0
-            pre_e = self.spin_prestim_end_2.value()   / 1000.0
-        else:
-            pre_s = self.spin_prestim_start.value() / 1000.0
-            pre_e = self.spin_prestim_end.value()   / 1000.0
-        n     = len(arr)
-        dur   = self.scope_pre + self.scope_post
-        spt   = dur / max(n - 1, 1)
-        t_rel = np.arange(n) * spt - self.scope_pre
-        pre_data = arr[(t_rel >= pre_s) & (t_rel <= pre_e)]
-        if pre_data.size > 0:
-            return float(np.sqrt(np.nanmean(pre_data ** 2)))
-        return 0.0
+        s = self.L if side == "left" else self.R
+        s.hunt_num_lbl.setText(str(s.hunt_num))
+        s.hunt_den_lbl.setText(str(s.hunt_den))
 
     def _set_table_cell(self, tbl, row, col, text):
         if row < tbl.rowCount():
@@ -899,48 +870,129 @@ class RealTimeViewer(QMainWindow):
             tbl.setItem(row, col, item)
 
     def _both_hunt_active(self):
-        return (self.hunt_panel_left.isEnabled()  and self.hunt_chk_left.isChecked() and
-                self.hunt_panel_right.isEnabled() and self.hunt_chk_right.isChecked())
+        return all(s.hunt_panel.isEnabled() and s.hunt_chk.isChecked() for s in (self.L, self.R))
 
     def _on_hunt_clear(self, side):
-        sides = ["left", "right"] if self._both_hunt_active() else [side]
-        for s in sides:
-            if s == "left":
-                self.hunt_num_val_left = 0;  self.hunt_den_val_left = 0
-                self.hunt_history_left.clear()
-                self.hunt_latest_eval_left = True
-                self._update_hunt_display("left")
-            else:
-                self.hunt_num_val_right = 0; self.hunt_den_val_right = 0
-                self.hunt_history_right.clear()
-                self.hunt_latest_eval_right = True
-                self._update_hunt_display("right")
+        targets = (self.L, self.R) if self._both_hunt_active() else (self.L if side == "left" else self.R,)
+        for s in targets:
+            s.hunt_num = 0; s.hunt_den = 0
+            s.hunt_history.clear()
+            s.hunt_latest_eval = True
+            self._update_hunt_display("left" if s is self.L else "right")
 
     def _on_hunt_redo(self, side):
-        sides = ["left", "right"] if self._both_hunt_active() else [side]
-        for s in sides:
-            if s == "left" and self.hunt_history_left:
-                self.hunt_num_val_left, self.hunt_den_val_left = self.hunt_history_left.pop()
-                self.hunt_latest_eval_left = True
-                self._update_hunt_display("left")
-            elif s == "right" and self.hunt_history_right:
-                self.hunt_num_val_right, self.hunt_den_val_right = self.hunt_history_right.pop()
-                self.hunt_latest_eval_right = True
-                self._update_hunt_display("right")
+        targets = (self.L, self.R) if self._both_hunt_active() else (self.L if side == "left" else self.R,)
+        for s in targets:
+            if s.hunt_history:
+                s.hunt_num, s.hunt_den = s.hunt_history.pop()
+                s.hunt_latest_eval = True
+                self._update_hunt_display("left" if s is self.L else "right")
 
     def _on_new_best(self):
-        label = f"{self.spin_mso.value()}%at{self.spin_location.value()}"
+        label = f"{self._mso1_val}%at{self.spin_location.value()}"
         self.combo_best.addItem(label)
         idx = self.combo_best.count() - 1
         self.combo_best.setItemData(idx, QColor("red"), Qt.ForegroundRole)
         self.combo_best.setCurrentIndex(idx)
 
     def _on_equal_best(self):
-        label = f"{self.spin_mso.value()}%at{self.spin_location.value()}"
+        label = f"{self._mso1_val}%at{self.spin_location.value()}"
         self.combo_best.addItem(label)
         idx = self.combo_best.count() - 1
         self.combo_best.setItemData(idx, QColor("#e65100"), Qt.ForegroundRole)
         self.combo_best.setCurrentIndex(idx)
+
+    def _on_sm_clicked(self):
+        self._magstim_mode = "SM"
+        self.btn_sm.setStyleSheet("background-color: #1565C0; color: white;")
+        self.btn_dm.setStyleSheet("")
+        self.lbl_mso2.setEnabled(False)
+        self.lbl_mso2_val.setEnabled(False)
+        self.lbl_mso2_val.setText("—")
+        self.lbl_ipi.setEnabled(False)
+        self.lbl_isi_val.setEnabled(False)
+        self.lbl_isi_val.setText("—")
+
+    def _on_dm_clicked(self):
+        self._magstim_mode = "DM"
+        self.btn_dm.setStyleSheet("background-color: #1565C0; color: white;")
+        self.btn_sm.setStyleSheet("")
+        self.lbl_mso2.setEnabled(True)
+        self.lbl_mso2_val.setEnabled(True)
+        self.lbl_ipi.setEnabled(True)
+        self.lbl_isi_val.setEnabled(True)
+
+    def _connect_magstim(self):
+        if not _SERIAL_AVAILABLE:
+            return
+        try:
+            port = serial.Serial(
+                port=MAGSTIM_PORT, baudrate=9600,
+                bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE, timeout=0.3,
+            )
+            self._magstim_port = port
+            self._magstim_stop.clear()
+            t = threading.Thread(target=self._magstim_thread_func, daemon=True)
+            t.start()
+        except Exception:
+            pass
+
+    def _magstim_thread_func(self):
+        try:
+            disable_remote(self._magstim_port)
+        except Exception:
+            pass
+        while not self._magstim_stop.wait(MAGSTIM_POLL_MS / 1000.0):
+            if self._magstim_port is None:
+                break
+            try:
+                params = get_parameters(self._magstim_port)
+                temp   = get_temperature(self._magstim_port)
+                if params is not None:
+                    self._magstim_polled.emit({"params": params, "temp": temp})
+            except Exception:
+                pass
+
+    def _on_magstim_polled(self, data):
+        self._magstim_last_poll_t = time.time()
+        params = data["params"]
+        temp   = data["temp"]
+        f = params["flags"]
+        state = "RDY" if f["ready"] else "ARM" if f["armed"] else "SBY"
+
+        self.lbl_magstim_dot.setStyleSheet("color: #2e7d32;")
+        self.lbl_magstim_dot.setToolTip(MAGSTIM_PORT)
+        self.lbl_magstim_state.setText(state)
+        self.lbl_magstim_state.setStyleSheet(
+            "color: #2e7d32;" if f["ready"] else
+            "color: #e65100;" if f["armed"] else
+            "color: #555555;"
+        )
+
+        if temp is not None:
+            t1 = temp["temp1"] / 10.0
+            t2 = temp["temp2"] / 10.0
+            avg_c = (t1 + t2) / 2.0
+            self.lbl_magstim_temp.setText(f"{avg_c:.1f}°C")
+            self.lbl_magstim_temp.setToolTip(
+                f"Coil1: {t1:.1f}°C    Coil2: {t2:.1f}°C"
+            )
+
+        self._mso1_val = params["power_a"]
+        self.lbl_mso_val.setText(str(params["power_a"]))
+        if self._magstim_mode == "DM":
+            self.lbl_mso2_val.setText(str(params["power_b"]))
+            self.lbl_isi_val.setText(f"{params['ipi'] / 10.0:.1f} ms")
+
+    def closeEvent(self, event):
+        self._magstim_stop.set()
+        if self._magstim_port is not None:
+            try:
+                self._magstim_port.close()
+            except Exception:
+                pass
+        super().closeEvent(event)
 
     def _on_separate_toggled(self, checked):
         self.separate = checked
@@ -971,21 +1023,14 @@ class RealTimeViewer(QMainWindow):
     # Channel dropdowns
     # ------------------------------------------------------------------
 
-    def _on_combo_left(self, idx):
+    def _on_combo(self, side, idx):
         if not self.ch_info or idx < 0:
             return
-        self.ch_left = idx
+        s = self.L if side == "left" else self.R
+        s.ch = idx
         name, unit = self.ch_info[idx]
-        self.plot_left.setTitle(f"<b>{name}</b>", color=COLOR_LEFT, size="11pt")
-        self.plot_left.setLabel("left", unit)
-
-    def _on_combo_right(self, idx):
-        if not self.ch_info or idx < 0:
-            return
-        self.ch_right = idx
-        name, unit = self.ch_info[idx]
-        self.plot_right.setTitle(f"<b>{name}</b>", color=COLOR_RIGHT, size="11pt")
-        self.plot_right.setLabel("left", unit)
+        s.plot.setTitle(f"<b>{name}</b>", color=s.color, size="11pt")
+        s.plot.setLabel("left", unit)
 
     # ------------------------------------------------------------------
     # COM event pump & trigger handler
@@ -1085,7 +1130,6 @@ class RealTimeViewer(QMainWindow):
                 self.lbl_status.setStyleSheet("color: #e65100;")
         except Exception:
             self.client = None
-            self._event_sink = None
             self._com_thread = None
             self.btn_sample.setEnabled(False)
             if self.is_running:
@@ -1095,23 +1139,28 @@ class RealTimeViewer(QMainWindow):
             self.lbl_status.setText("✕  LabChart Not Connected")
             self.lbl_status.setStyleSheet("color: #b71c1c;")
 
+        # Magstim connection timeout: grey out if no poll for >3 seconds
+        if self._magstim_last_poll_t > 0 and time.time() - self._magstim_last_poll_t > 3.0:
+            self.lbl_magstim_dot.setStyleSheet("color: #aaaaaa;")
+            self.lbl_magstim_state.setText("—")
+            self.lbl_magstim_state.setStyleSheet("color: #aaaaaa;")
+            self.lbl_magstim_temp.setText("—")
+            self.lbl_magstim_temp.setToolTip("Coil temp unavailable")
+
     def _populate_combos(self):
         new_info = self.client.get_channel_info()
         if new_info == self.ch_info:
             return
         self.ch_info = new_info
-        for combo, default in (
-            (self.combo_left,  DEFAULT_CH_LEFT),
-            (self.combo_right, DEFAULT_CH_RIGHT),
-        ):
-            combo.blockSignals(True)
-            combo.clear()
+        for s, default in ((self.L, DEFAULT_CH_LEFT), (self.R, DEFAULT_CH_RIGHT)):
+            s.combo.blockSignals(True)
+            s.combo.clear()
             for i, (name, unit) in enumerate(self.ch_info):
-                combo.addItem(f"Ch{i + 1}  {name}  [{unit}]")
-            combo.setCurrentIndex(min(default, len(self.ch_info) - 1))
-            combo.blockSignals(False)
-        self._on_combo_left(self.combo_left.currentIndex())
-        self._on_combo_right(self.combo_right.currentIndex())
+                s.combo.addItem(f"Ch{i + 1}  {name}  [{unit}]")
+            s.combo.setCurrentIndex(min(default, len(self.ch_info) - 1))
+            s.combo.blockSignals(False)
+        self._on_combo("left",  self.L.combo.currentIndex())
+        self._on_combo("right", self.R.combo.currentIndex())
 
     # ------------------------------------------------------------------
     # Play / Stop / Sample / Open
@@ -1183,7 +1232,7 @@ class RealTimeViewer(QMainWindow):
         if self.mode == "scope" and value >= 1:
             idx = min(value - 1, len(self.trigger_times) - 1)
             if idx >= 0:
-                channels = list({self.ch_left, self.ch_right})
+                channels = list({self.L.ch, self.R.ch})
                 self._update_scope(channels, selected_row=idx)
 
     def _register_trigger(self, t, add_table_row=True):
@@ -1197,28 +1246,24 @@ class RealTimeViewer(QMainWindow):
         self.trigger_spin.setEnabled(self.mode == "scope")
         if not add_table_row:
             return
-        self.hunt_latest_eval_left  = False
-        self.hunt_latest_eval_right = False
-        self.table_latest_eval_left  = False
-        self.table_latest_eval_right = False
+        for s in (self.L, self.R):
+            s.hunt_latest_eval  = False
+            s.table_latest_eval = False
         loc_id  = self.spin_location.value()
-        mso_pct = self.spin_mso.value()
-        for tbl, ch_idx in ((self.table_left, self.ch_left), (self.table_right, self.ch_right)):
-            row = tbl.rowCount()
-            tbl.insertRow(row)
-            for col, val in enumerate([str(ch_idx + 1), str(loc_id), str(mso_pct), str(trial_num), "—", "—"]):
+        mso_pct = self._mso1_val
+        for s in (self.L, self.R):
+            row = s.table.rowCount()
+            s.table.insertRow(row)
+            for col, val in enumerate([str(s.ch + 1), str(loc_id), str(mso_pct), str(trial_num), "—", "—"]):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignCenter)
-                tbl.setItem(row, col, item)
-            tbl.scrollToBottom()
-        if self.hunt_panel_left.isEnabled() and self.hunt_chk_left.isChecked():
-            self.hunt_history_left.append((self.hunt_num_val_left, self.hunt_den_val_left))
-            self.hunt_den_val_left += 1
-            self._update_hunt_display("left")
-        if self.hunt_panel_right.isEnabled() and self.hunt_chk_right.isChecked():
-            self.hunt_history_right.append((self.hunt_num_val_right, self.hunt_den_val_right))
-            self.hunt_den_val_right += 1
-            self._update_hunt_display("right")
+                s.table.setItem(row, col, item)
+            s.table.scrollToBottom()
+        for s in (self.L, self.R):
+            if s.hunt_panel.isEnabled() and s.hunt_chk.isChecked():
+                s.hunt_history.append((s.hunt_num, s.hunt_den))
+                s.hunt_den += 1
+                self._update_hunt_display("left" if s is self.L else "right")
 
     def _open_labchart(self):
         search_dir = Path(__file__).parent
@@ -1233,36 +1278,10 @@ class RealTimeViewer(QMainWindow):
     # Real-time update
     # ------------------------------------------------------------------
 
-    def _check_trigger_channel(self):
-        try:
-            data, t_start, t_end = self.client.get_latest_data(
-                window_secs=0.3, channels=[TRIGGER_CH_IDX])
-        except Exception:
-            return
-        arr = data.get(TRIGGER_CH_IDX)
-        if arr is None or len(arr) == 0:
-            return
-        above = arr > TRIGGER_THRESHOLD
-        if not above.any():
-            return
-        transitions = np.diff(above.astype(int))
-        starts = np.where(transitions == 1)[0] + 1
-        if len(starts) == 0:
-            if above[0]:
-                starts = np.array([0])
-            else:
-                return
-        first_idx = int(starts[0])
-        t_trigger = t_start + (t_end - t_start) * first_idx / max(len(arr) - 1, 1)
-        if self._last_trigger_t is not None and t_trigger - self._last_trigger_t < TRIGGER_REFRACTORY:
-            return
-        self._last_trigger_t = t_trigger
-        self._register_trigger(t_trigger, add_table_row=True)
-
     def _update(self):
         if self.client is None:
             return
-        channels = list({self.ch_left, self.ch_right})
+        channels = list({self.L.ch, self.R.ch})
 
         if self.mode == "chart":
             self._update_chart(channels)
@@ -1279,8 +1298,8 @@ class RealTimeViewer(QMainWindow):
             print(f"[chart update] {e}")
             return
 
-        self._draw(self.curve_left,  data.get(self.ch_left),  t_start, t_end, offset=0)
-        self._draw(self.curve_right, data.get(self.ch_right), t_start, t_end, offset=0)
+        self._draw(self.L.curve, data.get(self.L.ch), t_start, t_end, offset=0)
+        self._draw(self.R.curve, data.get(self.R.ch), t_start, t_end, offset=0)
         self._redraw_trigger_lines_chart(t_start, t_end)
 
     def _update_scope(self, channels, selected_row=None):
@@ -1323,145 +1342,109 @@ class RealTimeViewer(QMainWindow):
         else:
             t_scale  = 1.0
             x_label  = "Time from trigger (s)"
-        self.plot_left.setLabel("bottom",  x_label)
-        self.plot_right.setLabel("bottom", x_label)
+        for s in (self.L, self.R):
+            s.plot.setLabel("bottom", x_label)
 
-        arr_left  = data.get(self.ch_left)
-        arr_right = data.get(self.ch_right)
-        self._draw(self.curve_left,  arr_left,  t_start, t_end, offset=trigger_t, t_scale=t_scale)
-        self._draw(self.curve_right, arr_right, t_start, t_end, offset=trigger_t, t_scale=t_scale)
+        arr_L = data.get(self.L.ch)
+        arr_R = data.get(self.R.ch)
+        sides = ((self.L, arr_L), (self.R, arr_R))
+        for s, a in sides:
+            self._draw(s.curve, a, t_start, t_end, offset=trigger_t, t_scale=t_scale)
         self._redraw_trigger_lines_scope(t_scale=t_scale)
 
         # Y-range: respect Fix/Auto state per plot
-        for plot, arr, yfix, yhalf in (
-            (self.plot_left,  arr_left,  self._yfix_left,  self._yhalf_left),
-            (self.plot_right, arr_right, self._yfix_right, self._yhalf_right),
-        ):
-            plot.enableAutoRange(axis="y", enable=False)
-            if yfix:
-                plot.setYRange(-yhalf, yhalf, padding=0)
+        for s, a in sides:
+            s.plot.enableAutoRange(axis="y", enable=False)
+            if s.yfix:
+                s.plot.setYRange(-s.yhalf, s.yhalf, padding=0)
             else:
-                r = self._artifact_free_range(arr, t_start, t_end, trigger_t)
-                if r is not None:
-                    ymin, ymax = r
+                rng = self._artifact_free_range(a, t_start, t_end, trigger_t)
+                if rng is not None:
+                    ymin, ymax = rng
                     pad = (ymax - ymin) * 0.1 if ymax != ymin else 0.1
-                    plot.setYRange(ymin - pad, ymax + pad, padding=0)
+                    s.plot.setYRange(ymin - pad, ymax + pad, padding=0)
 
-        if self.radio_mep.isChecked():
-            if arr_left  is not None:
-                self._update_stats(self.stats_left,  arr_left,  t_start, trigger_t, t_scale, second=False)
-            if arr_right is not None:
-                self._update_stats(self.stats_right, arr_right, t_start, trigger_t, t_scale, second=self.separate)
-        else:
-            self.stats_left.setText("Prestim RMS\n—\n\nMEP amp\n—")
-            self.stats_right.setText("Prestim RMS\n—\n\nMEP amp\n—")
-
-        # Hunt evaluation — only for the latest trigger, only once
+        # Evaluate both sides once; reuse for display, hunt, and table
         is_latest = (selected_row == len(self.trigger_times) - 1)
+        if self.radio_mep.isChecked():
+            r_L = self._analyse_epoch(arr_L, second=False)
+            r_R = self._analyse_epoch(arr_R, second=self.separate)
+            self._update_stats(self.L.stats, arr_L, second=False)
+            self._update_stats(self.R.stats, arr_R, second=self.separate)
+        else:
+            r_L = r_R = None
+            for s in (self.L, self.R):
+                s.stats.setText("Prestim RMS\n—\n\nMEP amp\n—")
+
+        # Hunt + table fill — latest trigger only, once
         if is_latest and self.radio_mep.isChecked():
-            if (self.hunt_panel_left.isEnabled() and self.hunt_chk_left.isChecked()
-                    and not self.hunt_latest_eval_left and arr_left is not None):
-                amp = self._compute_mep_amp(arr_left, second=False)
-                if amp > self.spin_threshold.value():
-                    self.hunt_num_val_left += 1
-                    self._update_hunt_display("left")
-                self.hunt_latest_eval_left = True
+            for s, r in ((self.L, r_L), (self.R, r_R)):
+                if s.hunt_panel.isEnabled() and s.hunt_chk.isChecked() and not s.hunt_latest_eval and r is not None:
+                    thr = (self.spin_threshold_2.value() if (s is self.R and self.separate)
+                           else self.spin_threshold.value())
+                    if r["mep_amp"] > thr:
+                        s.hunt_num += 1
+                        self._update_hunt_display("left" if s is self.L else "right")
+                    s.hunt_latest_eval = True
 
-            if (self.hunt_panel_right.isEnabled() and self.hunt_chk_right.isChecked()
-                    and not self.hunt_latest_eval_right and arr_right is not None):
-                threshold = self.spin_threshold_2.value() if self.separate else self.spin_threshold.value()
-                amp = self._compute_mep_amp(arr_right, second=self.separate)
-                if amp > threshold:
-                    self.hunt_num_val_right += 1
-                    self._update_hunt_display("right")
-                self.hunt_latest_eval_right = True
-
-        # Table MEP/RMS fill — latest trigger only, once
-        if is_latest:
-            row = selected_row  # table row index matches trigger index
-            if not self.table_latest_eval_left and arr_left is not None and self.radio_mep.isChecked():
-                amp = self._compute_mep_amp(arr_left, second=False)
-                rms = self._compute_prestim_rms(arr_left, second=False)
-                self._set_table_cell(self.table_left, row, 4, f"{amp:.3f} mV")
-                self._set_table_cell(self.table_left, row, 5, f"{rms:.3f} mV")
-                self.table_latest_eval_left = True
-            if not self.table_latest_eval_right and arr_right is not None and self.radio_mep.isChecked():
-                amp = self._compute_mep_amp(arr_right, second=self.separate)
-                rms = self._compute_prestim_rms(arr_right, second=self.separate)
-                self._set_table_cell(self.table_right, row, 4, f"{amp:.3f} mV")
-                self._set_table_cell(self.table_right, row, 5, f"{rms:.3f} mV")
-                self.table_latest_eval_right = True
+            row = selected_row
+            for s, r in ((self.L, r_L), (self.R, r_R)):
+                if not s.table_latest_eval and r is not None:
+                    self._set_table_cell(s.table, row, 4, f"{r['mep_amp']:.3f} mV")
+                    self._set_table_cell(s.table, row, 5, f"{r['prestim_rms']:.3f} mV")
+                    s.table_latest_eval = True
 
     # ------------------------------------------------------------------
     # Trigger lines
     # ------------------------------------------------------------------
 
     def _clear_trigger_lines(self):
-        for line in self._vlines_left:
-            self.plot_left.removeItem(line)
-        for line in self._vlines_right:
-            self.plot_right.removeItem(line)
-        self._vlines_left.clear()
-        self._vlines_right.clear()
-        for item in self._shades_left:
-            self.plot_left.removeItem(item)
-        for item in self._shades_right:
-            self.plot_right.removeItem(item)
-        self._shades_left.clear()
-        self._shades_right.clear()
+        for s in (self.L, self.R):
+            for line in s.vlines: s.plot.removeItem(line)
+            for item in s.shades: s.plot.removeItem(item)
+            s.vlines.clear()
+            s.shades.clear()
 
     def _redraw_trigger_lines_chart(self, t_start, t_end):
         self._clear_trigger_lines()
         pen = pg.mkPen("#ff6f00", width=3, style=Qt.DashLine)
         for t in self.trigger_times:
             if t_start <= t <= t_end:
-                l = pg.InfiniteLine(pos=t,   angle=90, pen=pen)
-                r = pg.InfiniteLine(pos=t,   angle=90, pen=pen)
-                self.plot_left.addItem(l)
-                self.plot_right.addItem(r)
-                self._vlines_left.append(l)
-                self._vlines_right.append(r)
+                for s in (self.L, self.R):
+                    line = pg.InfiniteLine(pos=t, angle=90, pen=pen)
+                    s.plot.addItem(line)
+                    s.vlines.append(line)
 
     def _redraw_trigger_lines_scope(self, t_scale=1.0):
         self._clear_trigger_lines()
         pen = pg.mkPen("#ff6f00", width=3, style=Qt.DashLine)
-        # Trigger marker at 0
-        l = pg.InfiniteLine(pos=0, angle=90, pen=pen)
-        r = pg.InfiniteLine(pos=0, angle=90, pen=pen)
-        self.plot_left.addItem(l)
-        self.plot_right.addItem(r)
-        self._vlines_left.append(l)
-        self._vlines_right.append(r)
+        for s in (self.L, self.R):
+            line = pg.InfiniteLine(pos=0, angle=90, pen=pen)
+            s.plot.addItem(line)
+            s.vlines.append(line)
 
-        # Analysis window shading (only when MEP mode is on)
         if self.radio_mep.isChecked():
-            def _add_shades(plot, shade_list, spin_pre_s, spin_pre_e, spin_mep_s, spin_mep_e):
-                ps = spin_pre_s.value() / 1000.0 * t_scale
-                pe = spin_pre_e.value() / 1000.0 * t_scale
-                ms = spin_mep_s.value() / 1000.0 * t_scale
-                me = spin_mep_e.value() / 1000.0 * t_scale
-                for vals in ((ps, pe), (ms, me)):
+            def _add_shades(s, pre_s_spin, pre_e_spin, mep_s_spin, mep_e_spin):
+                for a, b in (
+                    (pre_s_spin.value() / 1000.0 * t_scale, pre_e_spin.value() / 1000.0 * t_scale),
+                    (mep_s_spin.value() / 1000.0 * t_scale, mep_e_spin.value() / 1000.0 * t_scale),
+                ):
                     region = pg.LinearRegionItem(
-                        values=vals,
+                        values=(a, b),
                         brush=pg.mkBrush(255, 220, 0, 60),
                         pen=pg.mkPen(None),
                         movable=False,
                     )
-                    plot.addItem(region)
-                    shade_list.append(region)
+                    s.plot.addItem(region)
+                    s.shades.append(region)
 
-            # Left always uses first set
-            _add_shades(self.plot_left, self._shades_left,
-                        self.spin_prestim_start, self.spin_prestim_end,
+            _add_shades(self.L, self.spin_prestim_start, self.spin_prestim_end,
                         self.spin_mep_start, self.spin_mep_end)
-            # Right uses second set if Separate is ON, otherwise first
             if self.separate:
-                _add_shades(self.plot_right, self._shades_right,
-                            self.spin_prestim_start_2, self.spin_prestim_end_2,
+                _add_shades(self.R, self.spin_prestim_start_2, self.spin_prestim_end_2,
                             self.spin_mep_start_2, self.spin_mep_end_2)
             else:
-                _add_shades(self.plot_right, self._shades_right,
-                            self.spin_prestim_start, self.spin_prestim_end,
+                _add_shades(self.R, self.spin_prestim_start, self.spin_prestim_end,
                             self.spin_mep_start, self.spin_mep_end)
 
     # ------------------------------------------------------------------

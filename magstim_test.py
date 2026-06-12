@@ -90,6 +90,22 @@ def get_parameters(port: serial.Serial) -> dict | None:
         return None
 
 
+def get_temperature(port: serial.Serial) -> dict | None:
+    """
+    F@ query — returns coil temperatures.
+    Response: 1 echo (F) + 1 status + 3 Temp1 + 3 Temp2 + 1 CRC = 9 bytes.
+    """
+    resp = send_recv(port, "F@", 9)
+    if resp is None:
+        return None
+    try:
+        temp1 = int(resp[2:5].decode("latin-1"))
+        temp2 = int(resp[5:8].decode("latin-1"))
+        return {"temp1": temp1, "temp2": temp2}
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
 def set_power_a(port: serial.Serial, value: int) -> bool:
     """Set Channel A power (0–100)."""
     cmd = f"@{value:03d}"
