@@ -13,9 +13,10 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QLabel, QSpinBox, QApplication,
     QRadioButton, QButtonGroup, QDoubleSpinBox, QCheckBox, QAbstractSpinBox, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView, QGraphicsOpacityEffect, QStackedWidget,
+    QTabBar, QToolTip,
 )
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtGui import QFont, QColor, QCursor
 
 try:
     import serial
@@ -110,6 +111,758 @@ class _WheelSpinBox(QSpinBox):
         self.selectAll()
 
 
+class CalculatorWindow(QWidget):
+    """MSO percentage calculator, always on top."""
+
+    _PCTS = list(range(10, 210, 10))  # 10, 20, ..., 200
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Window)
+        self.setWindowTitle("MSO Calculator")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(8)
+
+        # Left: input + Cal button (same level as table)
+        left = QWidget()
+        left.setFixedWidth(88)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(4)
+        ll.addStretch()
+        ll.addWidget(QLabel("rMT MSO"))
+        self._spin = _WheelSpinBox()
+        self._spin.setRange(1, 100)
+        self._spin.setValue(50)
+        self._spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        ll.addWidget(self._spin)
+        btn_cal = QPushButton("Cal")
+        btn_cal.clicked.connect(self._on_cal)
+        ll.addWidget(btn_cal)
+        ll.addStretch()
+        outer.addWidget(left)
+
+        # Right: table — columns = %, single row updated on each Cal
+        self._table = QTableWidget(0, len(self._PCTS))
+        self._table.setHorizontalHeaderLabels([f"{p}%" for p in self._PCTS])
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.verticalHeader().setVisible(True)
+        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.setSelectionMode(QTableWidget.NoSelection)
+        self._table.setFocusPolicy(Qt.NoFocus)
+        outer.addWidget(self._table)
+
+        self.resize(800, 100)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fit_height()
+
+    def _fit_height(self):
+        hh = self._table.horizontalHeader().height()
+        row_h = self._table.rowHeight(0) if self._table.rowCount() > 0 else 24
+        sb_h = self._table.horizontalScrollBar().height()
+        self.resize(self.width(), hh + row_h + sb_h + 28)
+
+    def _on_cal(self):
+        rmt = self._spin.value()
+        self._table.setRowCount(0)
+        self._table.insertRow(0)
+        self._table.setVerticalHeaderItem(0, QTableWidgetItem(f"rMT {rmt}"))
+
+        first_exceeded = False
+        for i, pct in enumerate(self._PCTS):
+            mso = round(rmt * pct / 100)
+            exceeds = mso > 100
+            if exceeds and first_exceeded:
+                item = QTableWidgetItem("")
+            else:
+                item = QTableWidgetItem(str(mso))
+                item.setTextAlignment(Qt.AlignCenter)
+                if exceeds:
+                    item.setForeground(QColor(150, 150, 150))
+                    first_exceeded = True
+            self._table.setItem(0, i, item)
+
+        self._table.resizeRowsToContents()
+        self._fit_height()
+        idx_100 = self._PCTS.index(100)
+        self._table.scrollTo(
+            self._table.model().index(0, idx_100),
+            QTableWidget.PositionAtCenter
+        )
+
+
+class PlotWindow(QWidget):
+    """Standalone window: scatter plot (top) + tabbed merged data table (bottom)."""
+
+    _COLS = ["Trial", "CH", "Hand", "Paralysis", "Loc_ID", "MSO1", "MSO2", "ISI",
+             "MEP_amp", "Prestim_mean", "Temp", "Mode"]
+
+    # ch number → RGBA tuple
+    _CH_COLORS = {
+        3: (33,  150, 243, 200),   # blue
+        4: (244,  67,  54, 200),   # red
+        5: ( 76, 175,  80, 200),   # green
+        6: (255, 152,   0, 200),   # orange
+        7: (156,  39, 176, 200),   # purple
+        8: (  0, 188, 212, 200),   # cyan
+    }
+    _FALLBACK = [(255, 87, 34, 200), (96, 125, 139, 200),
+                 (233, 30, 99, 200), (121, 85, 72, 200)]
+
+    # (display name, column index in _COLS)
+    _PLOT_COLS = [
+        ("MEP_amp",      8),
+        ("Prestim_mean", 9),
+        ("Trial",        0),
+        ("MSO1",         5),
+        ("MSO2",         6),
+        ("ISI",          7),
+        ("Temp",         10),
+        ("Loc_ID",       4),
+    ]
+    _CATEGORICAL_X      = {4, 5, 6, 7}   # Loc_ID, MSO1, MSO2, ISI → categorical x-axis
+    _ZERO_PLACEHOLDER   = {8, 9}   # MEP_amp, Prestim_mean start as 0 placeholder
+
+    def __init__(self, viewer, parent=None):
+        super().__init__(parent, Qt.Window)
+        self._viewer       = viewer
+        self._resizing     = False
+        self._all_rows     = []   # cached merged+sorted rows
+        self._tab_channels = []   # CH int values for tabs index 1,2,...
+        self._scatter_items  = {}   # ch_int -> ScatterPlotItem (individual dots)
+        self._median_items   = {}   # ch_int -> ScatterPlotItem (median dots)
+        self._errbar_items   = {}   # ch_int -> ErrorBarItem (IQR)
+        self._median_data    = {}   # ch_int -> list of {med, q1, q3} per x level
+        self._scatter_data   = {}   # ch_int -> list of {x_pos, y_val, trial}
+        self._legend_chs     = set()
+        self._excluded       = set()   # set of (ch, trial) tuples
+        self._use_mean       = False
+        self._hover_text     = ""
+        self._hover_timer    = QTimer(self)
+        self._hover_timer.setInterval(300)
+        self._hover_timer.timeout.connect(self._refresh_tooltip)
+        self._y_col          = 8   # default: MEP_amp
+        self._x_col          = 5   # default: MSO1
+        self.setWindowTitle("TMSviewer — Plot")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.resize(992, 558)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        # ── Scatter plot (9) + right button panel (1) ───────────────────
+        graph_area    = QWidget()
+        graph_row     = QHBoxLayout(graph_area)
+        graph_row.setContentsMargins(0, 0, 0, 0)
+        graph_row.setSpacing(4)
+
+        self.canvas = pg.GraphicsLayoutWidget()
+        self._plot_item = self.canvas.addPlot()
+        self._plot_item.setLabel("left",   "MEP amp")
+        self._plot_item.setLabel("bottom", "MSO1")
+        self._plot_item.showGrid(x=True, y=True, alpha=0.3)
+        self._plot_item.getAxis("bottom").setStyle(tickTextOffset=6)
+        self._plot_item.getAxis("left").enableAutoSIPrefix(False)
+        self._plot_item.scene().sigMouseMoved.connect(self._on_plot_mouse_moved)
+        graph_row.addWidget(self.canvas, stretch=9)
+
+        graph_btn_panel  = QWidget()
+        graph_btn_layout = QVBoxLayout(graph_btn_panel)
+        graph_btn_layout.setContentsMargins(2, 0, 2, 0)
+        graph_btn_layout.setSpacing(4)
+
+        self._btn_stat_mode = QPushButton("Mean")
+        self._btn_stat_mode.clicked.connect(self._on_toggle_stat_mode)
+        graph_btn_layout.addWidget(self._btn_stat_mode)
+
+        btn_save_plot = QPushButton("Save plot")
+        btn_save_plot.clicked.connect(self._on_save_plot)
+        graph_btn_layout.addWidget(btn_save_plot)
+
+        graph_btn_layout.addSpacing(84)
+
+        btn_calc = QPushButton("Calculator")
+        btn_calc.clicked.connect(self._on_open_calculator)
+        graph_btn_layout.addWidget(btn_calc)
+
+        graph_btn_layout.addStretch()
+        graph_row.addWidget(graph_btn_panel, stretch=1)
+
+        root.addWidget(graph_area, stretch=3)
+
+        # ── Legend bar (Y-axis controls left + channel colours centred) ────
+        self._legend_bar = QWidget()
+        legend_row = QHBoxLayout(self._legend_bar)
+        legend_row.setContentsMargins(4, 2, 4, 2)
+        legend_row.setSpacing(8)
+
+        legend_row.addWidget(QLabel("Y axis"))
+        self._btn_yfix = QPushButton("Fix")
+        self._btn_yfix.setFixedWidth(40)
+        self._btn_yfix.setCheckable(True)
+        self._btn_yfix.clicked.connect(self._on_yaxis_fix)
+        legend_row.addWidget(self._btn_yfix)
+        self._btn_yauto = QPushButton("Auto")
+        self._btn_yauto.setFixedWidth(44)
+        self._btn_yauto.setCheckable(True)
+        self._btn_yauto.setChecked(True)
+        self._btn_yauto.clicked.connect(self._on_yaxis_auto)
+        legend_row.addWidget(self._btn_yauto)
+
+        legend_row.addSpacing(14)
+        legend_row.addWidget(QLabel("Y:"))
+        self._combo_y = QComboBox()
+        for name, _ in self._PLOT_COLS:
+            self._combo_y.addItem(name)
+        self._combo_y.setCurrentIndex(0)   # MEP_amp
+        self._combo_y.currentIndexChanged.connect(self._on_y_changed)
+        legend_row.addWidget(self._combo_y)
+
+        legend_row.addSpacing(6)
+        legend_row.addWidget(QLabel("X:"))
+        self._combo_x = QComboBox()
+        for name, _ in self._PLOT_COLS:
+            self._combo_x.addItem(name)
+        self._combo_x.setCurrentIndex(3)   # MSO1
+        self._combo_x.currentIndexChanged.connect(self._on_x_changed)
+        legend_row.addWidget(self._combo_x)
+
+        legend_row.addStretch()
+
+        # Channel colour items live in a sub-widget so _update_legend
+        # can clear them without touching the Y-axis controls above.
+        self._ch_legend = QWidget()
+        self._legend_layout = QHBoxLayout(self._ch_legend)
+        self._legend_layout.setContentsMargins(0, 0, 0, 0)
+        self._legend_layout.setSpacing(16)
+        legend_row.addWidget(self._ch_legend)
+
+        legend_row.addStretch()
+
+        root.addWidget(self._legend_bar)
+
+        # ── Tab bar + table ─────────────────────────────────────────────
+        # ── Bottom area: table (9) + button panel (1) ───────────────────
+        bottom_area   = QWidget()
+        bottom_row    = QHBoxLayout(bottom_area)
+        bottom_row.setContentsMargins(0, 0, 0, 0)
+        bottom_row.setSpacing(4)
+
+        # Left: tab bar + table
+        table_area = QWidget()
+        ta_layout  = QVBoxLayout(table_area)
+        ta_layout.setContentsMargins(0, 0, 0, 8)
+        ta_layout.setSpacing(0)
+
+        self._tab_bar = QTabBar()
+        self._tab_bar.addTab("All")
+        self._tab_bar.currentChanged.connect(self._on_tab_changed)
+        ta_layout.addWidget(self._tab_bar)
+
+        self.merged_table = self._make_merged_table()
+        ta_layout.addWidget(self.merged_table)
+        bottom_row.addWidget(table_area, stretch=9)
+
+        # Right: action buttons
+        btn_panel  = QWidget()
+        btn_layout = QVBoxLayout(btn_panel)
+        btn_layout.setContentsMargins(2, 0, 2, 0)
+        btn_layout.setSpacing(4)
+
+        self._btn_exclude = QPushButton("Exclude")
+        self._btn_exclude.clicked.connect(self._on_exclude_clicked)
+        btn_layout.addWidget(self._btn_exclude)
+
+        btn_clear_excl = QPushButton("Excl.Clear")
+        btn_clear_excl.clicked.connect(self._on_clear_excluded)
+        btn_layout.addWidget(btn_clear_excl)
+
+        btn_layout.addStretch()
+        bottom_row.addWidget(btn_panel, stretch=1)
+
+        root.addWidget(bottom_area, stretch=1)
+
+    # ------------------------------------------------------------------
+
+    def _ch_color(self, ch):
+        if ch in self._CH_COLORS:
+            return self._CH_COLORS[ch]
+        return self._FALLBACK[(ch - 9) % len(self._FALLBACK)]
+
+    def _make_merged_table(self):
+        cols = self._COLS + ["Excl"]
+        tbl = QTableWidget(0, len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        tbl.horizontalHeader().setStretchLastSection(False)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        tbl.itemSelectionChanged.connect(self._on_table_selection_changed)
+        return tbl
+
+    def refresh(self):
+        """Rebuild from viewer L + R tables: update scatter plot, tabs, table."""
+        rows = []
+        for src in (self._viewer.L.table, self._viewer.R.table):
+            for r in range(src.rowCount()):
+                rows.append([
+                    src.item(r, c).text() if src.item(r, c) else ""
+                    for c in range(src.columnCount())
+                ])
+
+        def _key(row):
+            try:    ch    = int(row[1])
+            except: ch    = 0
+            try:    trial = int(row[0])
+            except: trial = 0
+            return (ch, trial)
+
+        rows.sort(key=_key)
+        self._all_rows = rows
+
+        # Add tabs for newly seen channels (ascending order)
+        unique_chs = sorted({int(r[1]) for r in rows if r[1].isdigit()})
+        for ch in unique_chs:
+            if ch not in self._tab_channels:
+                self._tab_channels.append(ch)
+                self._tab_bar.addTab(f"Ch{ch}")
+
+        self._refresh_plot()
+        self._populate_table()
+
+    # ── Scatter plot ───────────────────────────────────────────────────
+
+    def _refresh_plot(self):
+        tab_idx = self._tab_bar.currentIndex()
+        if tab_idx <= 0:
+            source_rows = self._all_rows
+        else:
+            ch_filter = str(self._tab_channels[tab_idx - 1])
+            source_rows = [r for r in self._all_rows if r[1] == ch_filter]
+
+        points = []
+        for row in source_rows:
+            try:
+                y_val  = float(row[self._y_col])
+                if self._y_col in self._ZERO_PLACEHOLDER and y_val == 0.0:
+                    continue
+                x_val  = float(row[self._x_col])
+                ch     = int(row[1])
+                trial  = int(row[0])
+                if (ch, trial) in self._excluded:
+                    continue
+                points.append((x_val, y_val, ch, trial))
+            except (ValueError, IndexError):
+                continue
+
+        if not points:
+            for d in (self._scatter_items, self._median_items, self._errbar_items):
+                for ch in list(d):
+                    self._plot_item.removeItem(d.pop(ch))
+            return
+
+        is_cat = self._x_col in self._CATEGORICAL_X
+        x_map_inv = {}   # position → original x value (used in tooltip)
+
+        if is_cat:
+            unique_x = sorted({p[0] for p in points})
+            x_map = {v: i for i, v in enumerate(unique_x)}
+            x_map_inv = {i: v for v, i in x_map.items()}
+            def _fmt(v):
+                try:
+                    f = float(v)
+                    return f"{f:.1f}" if f != int(f) else str(int(f))
+                except (ValueError, TypeError):
+                    return str(v)
+            self._plot_item.getAxis("bottom").setTicks(
+                [[(i, _fmt(v)) for i, v in enumerate(unique_x)]]
+            )
+            self._plot_item.setXRange(-0.5, len(unique_x) - 0.5, padding=0)
+            get_x = lambda p: x_map[p[0]]
+        else:
+            self._plot_item.getAxis("bottom").setTicks(None)
+            self._plot_item.enableAutoRange(axis="x")
+            get_x = lambda p: p[0]
+
+        by_ch = {}
+        for pt in points:
+            ch = pt[2]
+            by_ch.setdefault(ch, {"x": [], "y": [], "trial": []})
+            by_ch[ch]["x"].append(get_x(pt))
+            by_ch[ch]["y"].append(pt[1])
+            by_ch[ch]["trial"].append(pt[3])
+
+        for d in (self._scatter_items, self._median_items, self._errbar_items):
+            for ch in list(d):
+                if ch not in by_ch:
+                    self._plot_item.removeItem(d.pop(ch))
+
+        for ch, data in by_ch.items():
+            r, g, b, _ = self._ch_color(ch)
+            x_arr = np.array(data["x"])
+            y_arr = np.array(data["y"])
+
+            # Individual dots
+            if is_cat:
+                ind_pen   = pg.mkPen(r, g, b, 204)  # outline only, alpha≈0.8
+                ind_brush = pg.mkBrush(0, 0, 0, 0)   # transparent fill
+            else:
+                ind_pen   = pg.mkPen(None)
+                ind_brush = pg.mkBrush(r, g, b, 200)
+
+            self._scatter_data[ch] = [
+                {"x_pos": x, "y_val": y, "trial": t}
+                for x, y, t in zip(data["x"], data["y"], data["trial"])
+            ]
+            if ch not in self._scatter_items:
+                sc = pg.ScatterPlotItem(size=9)
+                self._plot_item.addItem(sc)
+                self._scatter_items[ch] = sc
+                sc.sigClicked.connect(
+                    lambda _sc, pts, ev, c=ch: self._on_scatter_clicked(c, pts)
+                )
+            self._scatter_items[ch].setData(
+                x=x_arr.tolist(), y=y_arr.tolist(),
+                pen=ind_pen, brush=ind_brush,
+            )
+
+            if is_cat:
+                # Compute median + IQR per x level
+                unique_xs = np.unique(x_arr)
+                med_x, med_y, tops, bots, level_data = [], [], [], [], []
+                for ux in unique_xs:
+                    vals = y_arr[x_arr == ux]
+                    med      = float(np.median(vals))
+                    q1       = float(np.percentile(vals, 25))
+                    q3       = float(np.percentile(vals, 75))
+                    mean_val = float(np.mean(vals))
+                    sd_val   = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+                    orig = x_map_inv.get(int(ux), ux)
+                    level_data.append({
+                        "x_pos": float(ux), "x_val": orig,
+                        "med": med, "q1": q1, "q3": q3,
+                        "mean": mean_val, "sd": sd_val,
+                    })
+                    cy = mean_val if self._use_mean else med
+                    med_x.append(float(ux))
+                    med_y.append(cy)
+                    if self._use_mean:
+                        tops.append(sd_val)
+                        bots.append(sd_val)
+                    else:
+                        tops.append(q3 - med)
+                        bots.append(med - q1)
+                self._median_data[ch] = level_data
+
+                med_x_arr = np.array(med_x)
+                med_y_arr = np.array(med_y)
+
+                # Median dots
+                if ch not in self._median_items:
+                    sc_med = pg.ScatterPlotItem(size=14)
+                    self._plot_item.addItem(sc_med)
+                    self._median_items[ch] = sc_med
+                self._median_items[ch].setData(
+                    x=med_x, y=med_y,
+                    pen=pg.mkPen(None),
+                    brush=pg.mkBrush(r, g, b, 255),
+                )
+
+                # IQR error bars
+                if ch not in self._errbar_items:
+                    eb = pg.ErrorBarItem(
+                        beam=0.15,
+                        pen=pg.mkPen(r, g, b, 200, width=2),
+                    )
+                    self._plot_item.addItem(eb)
+                    self._errbar_items[ch] = eb
+                self._errbar_items[ch].setData(
+                    x=med_x_arr, y=med_y_arr,
+                    top=np.array(tops), bottom=np.array(bots),
+                )
+            else:
+                for d in (self._median_items, self._errbar_items):
+                    if ch in d:
+                        self._plot_item.removeItem(d.pop(ch))
+
+        self._plot_item.enableAutoRange(axis="y")
+        self._update_legend(set(by_ch.keys()))
+        self._update_plot_title()
+
+    def _on_plot_mouse_moved(self, pos):
+        if not self._median_data or not self._plot_item.sceneBoundingRect().contains(pos):
+            self._hover_timer.stop()
+            self._hover_text = ""
+            QToolTip.hideText()
+            return
+        vb = self._plot_item.getViewBox()
+        mp = vb.mapSceneToView(pos)
+        mx, my = mp.x(), mp.y()
+        vr = self._plot_item.viewRange()
+        thresh_x = (vr[0][1] - vr[0][0]) * 0.04
+        thresh_y = (vr[1][1] - vr[1][0]) * 0.06
+        x_name = self._PLOT_COLS[self._combo_x.currentIndex()][0]
+        ch_info = self._viewer.ch_info
+        for ch, level_list in self._median_data.items():
+            for d in level_list:
+                if abs(mx - d["x_pos"]) < thresh_x and abs(my - d["med"]) < thresh_y:
+                    x_val = int(d["x_val"]) if float(d["x_val"]) == int(d["x_val"]) else d["x_val"]
+                    header = f"ch {ch}  |  {x_name} ({x_val})"
+                    if self._use_mean:
+                        self._hover_text = (
+                            f"{header}\n"
+                            f"Mean:   {d['mean']:.3f}\n"
+                            f"SD:     {d['sd']:.3f}"
+                        )
+                    else:
+                        self._hover_text = (
+                            f"{header}\n"
+                            f"Median: {d['med']:.3f}\n"
+                            f"Q1:     {d['q1']:.3f}\n"
+                            f"Q3:     {d['q3']:.3f}"
+                        )
+                    QToolTip.showText(QCursor.pos(), self._hover_text)
+                    self._hover_timer.start()
+                    return
+        # Individual dot hover (smaller threshold, lower priority than median)
+        thresh_xi = thresh_x * 0.6
+        thresh_yi = thresh_y * 0.6
+        for ch, pt_list in self._scatter_data.items():
+            for pt in pt_list:
+                if abs(mx - pt["x_pos"]) < thresh_xi and abs(my - pt["y_val"]) < thresh_yi:
+                    self._hover_text = f"ch {ch}  |  trial {pt['trial']}"
+                    QToolTip.showText(QCursor.pos(), self._hover_text)
+                    self._hover_timer.start()
+                    return
+
+        self._hover_timer.stop()
+        self._hover_text = ""
+        QToolTip.hideText()
+
+    def _refresh_tooltip(self):
+        if self._hover_text:
+            QToolTip.showText(QCursor.pos(), self._hover_text)
+
+    def _update_plot_title(self):
+        tab_idx = self._tab_bar.currentIndex()
+        if tab_idx <= 0:
+            ch_label = "All"
+        else:
+            ch = self._tab_channels[tab_idx - 1]
+            ch_info = self._viewer.ch_info
+            if ch_info and 0 < ch <= len(ch_info):
+                ch_label = ch_info[ch - 1][0]
+            else:
+                ch_label = f"Ch{ch}"
+        y_name = self._PLOT_COLS[self._combo_y.currentIndex()][0]
+        x_name = self._PLOT_COLS[self._combo_x.currentIndex()][0]
+        stat = "mean" if self._use_mean else "median"
+        self._plot_item.setTitle(f"({ch_label})  {y_name} vs. {x_name}  ({stat})")
+
+    def _on_scatter_clicked(self, ch, spots):
+        if not spots or ch not in self._scatter_data:
+            return
+        idx   = spots[0].index()
+        data  = self._scatter_data[ch]
+        if idx >= len(data):
+            return
+        trial = data[idx]["trial"]
+        ch_str    = str(ch)
+        trial_str = str(trial)
+        for row in range(self.merged_table.rowCount()):
+            ti = self.merged_table.item(row, 0)
+            ci = self.merged_table.item(row, 1)
+            if ti and ci and ti.text() == trial_str and ci.text() == ch_str:
+                self.merged_table.selectRow(row)
+                self.merged_table.scrollTo(
+                    self.merged_table.model().index(row, 0)
+                )
+                return
+
+    def _on_table_selection_changed(self):
+        selected = self.merged_table.selectionModel().selectedRows()
+        if not selected:
+            self._btn_exclude.setText("Exclude")
+            return
+        all_excluded = all(
+            self.merged_table.item(idx.row(), len(self._COLS)) is not None
+            and self.merged_table.item(idx.row(), len(self._COLS)).text() == "1"
+            for idx in selected
+        )
+        self._btn_exclude.setText("Include" if all_excluded else "Exclude")
+
+    def _on_exclude_clicked(self):
+        selected = self.merged_table.selectionModel().selectedRows()
+        include_mode = self._btn_exclude.text() == "Include"
+        for idx in selected:
+            row = idx.row()
+            try:
+                ch    = int(self.merged_table.item(row, 1).text())
+                trial = int(self.merged_table.item(row, 0).text())
+                if include_mode:
+                    self._excluded.discard((ch, trial))
+                else:
+                    self._excluded.add((ch, trial))
+            except (AttributeError, ValueError):
+                pass
+        self._populate_table()
+        self._refresh_plot()
+
+    def _on_clear_excluded(self):
+        self._excluded.clear()
+        self._populate_table()
+        self._refresh_plot()
+
+    def _on_toggle_stat_mode(self):
+        self._use_mean = not self._use_mean
+        self._btn_stat_mode.setText("Median" if self._use_mean else "Mean")
+        self._refresh_plot()
+
+    def _on_save_plot(self):
+        from PyQt5.QtWidgets import QFileDialog
+        tab_idx = self._tab_bar.currentIndex()
+        if tab_idx <= 0:
+            ch_label = "All"
+        else:
+            ch = self._tab_channels[tab_idx - 1]
+            ch_info = self._viewer.ch_info
+            ch_label = ch_info[ch - 1][0] if ch_info and 0 < ch <= len(ch_info) else f"Ch{ch}"
+        y_name    = self._PLOT_COLS[self._combo_y.currentIndex()][0]
+        x_name    = self._PLOT_COLS[self._combo_x.currentIndex()][0]
+        default   = f"({ch_label}) {y_name} vs. {x_name}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save plot", default, "PNG image (*.png);;All files (*)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        self.canvas.grab().save(path)
+
+    def _on_open_calculator(self):
+        if not hasattr(self, "_calc_window") or self._calc_window is None:
+            self._calc_window = CalculatorWindow(self)
+        self._calc_window.show()
+        self._calc_window.raise_()
+        self._calc_window.activateWindow()
+
+    def _on_y_changed(self, idx):
+        name, col = self._PLOT_COLS[idx]
+        self._y_col = col
+        self._plot_item.setLabel("left", name)
+        self._update_axis_exclusion()
+        self._on_yaxis_auto()
+        self._refresh_plot()
+
+    def _on_x_changed(self, idx):
+        name, col = self._PLOT_COLS[idx]
+        self._x_col = col
+        self._plot_item.setLabel("bottom", name)
+        self._update_axis_exclusion()
+        self._refresh_plot()
+
+    def _update_axis_exclusion(self):
+        y_idx = self._combo_y.currentIndex()
+        x_idx = self._combo_x.currentIndex()
+        for i in range(len(self._PLOT_COLS)):
+            self._combo_y.model().item(i).setEnabled(i != x_idx)
+            self._combo_x.model().item(i).setEnabled(i != y_idx)
+
+    def _on_yaxis_fix(self):
+        y_min, y_max = self._plot_item.getViewBox().viewRange()[1]
+        self._plot_item.enableAutoRange(axis="y", enable=False)
+        self._plot_item.setYRange(y_min, y_max, padding=0)
+        self._btn_yfix.setChecked(True)
+        self._btn_yauto.setChecked(False)
+
+    def _on_yaxis_auto(self):
+        self._plot_item.enableAutoRange(axis="y")
+        self._btn_yfix.setChecked(False)
+        self._btn_yauto.setChecked(True)
+
+    def _update_legend(self, active_chs):
+        if active_chs == self._legend_chs:
+            return
+        self._legend_chs = set(active_chs)
+
+        while self._legend_layout.count():
+            item = self._legend_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for ch in sorted(active_chs):
+            r, g, b, _ = self._ch_color(ch)
+            dot = QLabel()
+            dot.setFixedSize(12, 12)
+            dot.setStyleSheet(
+                f"background-color: rgb({r},{g},{b}); border-radius: 6px;"
+            )
+            self._legend_layout.addWidget(dot)
+            self._legend_layout.addWidget(QLabel(f"Ch{ch}"))
+
+    # ── Table ──────────────────────────────────────────────────────────
+
+    def _on_tab_changed(self, _idx):
+        self._refresh_plot()
+        self._populate_table()
+
+    def _populate_table(self):
+        idx = self._tab_bar.currentIndex()
+        if idx <= 0:
+            rows = self._all_rows
+        else:
+            ch_filter = str(self._tab_channels[idx - 1])
+            rows = [r for r in self._all_rows if r[1] == ch_filter]
+
+        self.merged_table.setRowCount(0)
+        for row_data in rows:
+            r = self.merged_table.rowCount()
+            self.merged_table.insertRow(r)
+            try:
+                is_excl = (int(row_data[1]), int(row_data[0])) in self._excluded
+            except (ValueError, IndexError):
+                is_excl = False
+            for c, val in enumerate(row_data):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignCenter)
+                if is_excl:
+                    item.setForeground(QColor(150, 150, 150))
+                self.merged_table.setItem(r, c, item)
+            excl_item = QTableWidgetItem("1" if is_excl else "0")
+            excl_item.setTextAlignment(Qt.AlignCenter)
+            if is_excl:
+                excl_item.setForeground(QColor(150, 150, 150))
+            self.merged_table.setItem(r, len(self._COLS), excl_item)
+        self.merged_table.scrollToBottom()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._resizing:
+            return
+        self._resizing = True
+        w = event.size().width()
+        target_h = round(w * 9 / 16)
+        if event.size().height() != target_h:
+            self.resize(w, target_h)
+        self._resizing = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._update_axis_exclusion()
+        self.refresh()
+
+    def closeEvent(self, event):
+        if hasattr(self, "_calc_window") and self._calc_window is not None:
+            self._calc_window.close()
+        super().closeEvent(event)
+
+
 class RealTimeViewer(QMainWindow):
     _tms_detected    = pyqtSignal(object)  # emitted from COM background thread, carries (record, tick)
     _magstim_polled  = pyqtSignal(object)  # emitted from Magstim poll thread, carries params dict
@@ -135,7 +888,11 @@ class RealTimeViewer(QMainWindow):
         self._magstim_stop = threading.Event()
         self._magstim_last_poll_t = 0.0
         self._mso1_val = 0
+        self._mso2_val = 0
+        self._isi_val  = "—"
+        self._temp_val = "—"
         self._magstim_polled.connect(self._on_magstim_polled)
+        self._plot_window = None
         self.window_secs   = WINDOW_SECS_DEFAULT
         self.scope_pre     = SCOPE_PRE_DEFAULT
         self.scope_post    = SCOPE_POST_DEFAULT
@@ -273,6 +1030,12 @@ class RealTimeViewer(QMainWindow):
         scope_p.addWidget(btn_scope_apply)
         self.widget_scope_params.setVisible(False)
         mode_row.addWidget(self.widget_scope_params)
+
+        mode_row.addSpacing(20)
+        mode_row.addWidget(QLabel("Paralysis:"))
+        self._paralysis_combo = QComboBox()
+        self._paralysis_combo.addItems(["NA", "LEFT", "RIGHT"])
+        mode_row.addWidget(self._paralysis_combo)
 
         mode_row.addStretch()
         return mode_row
@@ -502,11 +1265,22 @@ class RealTimeViewer(QMainWindow):
         tables_row = QHBoxLayout(); tables_row.setSpacing(8)
         self.L.table = self._make_data_table()
         self.R.table = self._make_data_table()
+
+        btn_plot = QPushButton("Plot"); btn_plot.setFixedWidth(130)
+        btn_plot.clicked.connect(self._on_plot_clicked)
         btn_save = QPushButton("Save"); btn_save.setFixedWidth(130)
         btn_save.clicked.connect(self._save_tables)
+        btn_clear_all = QPushButton("Clear"); btn_clear_all.setFixedWidth(130)
+        btn_clear_all.clicked.connect(self._on_clear_all)
+        centre_btns = QVBoxLayout()
+        centre_btns.setSpacing(6)
+        centre_btns.addWidget(btn_plot)
+        centre_btns.addWidget(btn_save)
+        centre_btns.addWidget(btn_clear_all)
+
         tables_row.addSpacing(81)
         tables_row.addWidget(self.L.table, stretch=1)
-        tables_row.addWidget(btn_save, alignment=Qt.AlignCenter)
+        tables_row.addLayout(centre_btns)
         tables_row.addWidget(self.R.table, stretch=1)
         tables_row.addSpacing(81)
         scope_vbox.addLayout(tables_row)
@@ -524,11 +1298,13 @@ class RealTimeViewer(QMainWindow):
         self.btn = QPushButton("▶  Play")
         self.btn.setFixedHeight(43)
         self.btn.setFont(_bf)
+        self.btn.setFocusPolicy(Qt.NoFocus)
         self.btn.clicked.connect(self._toggle)
 
         self.btn_sample = QPushButton("Sample")
         self.btn_sample.setFixedHeight(43)
         self.btn_sample.setFont(_bf)
+        self.btn_sample.setFocusPolicy(Qt.NoFocus)
         self.btn_sample.setEnabled(False)
         self.btn_sample.setStyleSheet(
             "QPushButton:enabled  { background-color: #2e7d32; color: white; }"
@@ -619,15 +1395,14 @@ class RealTimeViewer(QMainWindow):
         layout.addWidget(lbl_den)
         layout.addWidget(btn_clear)
         layout.addWidget(btn_redo)
-        layout.addStretch()
 
         s = self.L if side == "left" else self.R
-        s.hunt_panel  = panel
-        s.hunt_chk    = chk
+        s.hunt_panel   = panel
+        s.hunt_chk     = chk
         s.hunt_num_lbl = lbl_num
         s.hunt_den_lbl = lbl_den
-        s.hunt_clear  = btn_clear
-        s.hunt_redo   = btn_redo
+        s.hunt_clear   = btn_clear
+        s.hunt_redo    = btn_redo
         btn_clear.clicked.connect(lambda: self._on_hunt_clear(side))
         btn_redo.clicked.connect(lambda: self._on_hunt_redo(side))
 
@@ -637,37 +1412,88 @@ class RealTimeViewer(QMainWindow):
         outer.addStretch()
         return outer
 
+    def _on_plot_clicked(self):
+        if self._plot_window is None or not self._plot_window.isVisible():
+            self._plot_window = PlotWindow(self)
+        self._plot_window.refresh()
+        self._plot_window.show()
+        self._plot_window.raise_()
+        self._plot_window.activateWindow()
+
+    def _sync_plot_table(self):
+        if self._plot_window is not None and self._plot_window.isVisible():
+            self._plot_window.refresh()
+
     def _save_tables(self):
+        import csv
         from PyQt5.QtWidgets import QFileDialog
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Table", os.path.join(desktop, "tms_data.txt"),
-            "Text files (*.txt)"
+            self, "Save Data", os.path.join(desktop, "tms_data.csv"),
+            "CSV files (*.csv)"
         )
         if not path:
             return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
 
-        def table_to_text(tbl, title):
-            cols = [tbl.horizontalHeaderItem(c).text() for c in range(tbl.columnCount())]
-            lines = [title, "\t".join(cols)]
-            for r in range(tbl.rowCount()):
-                row_data = []
-                for c in range(tbl.columnCount()):
-                    item = tbl.item(r, c)
-                    row_data.append(item.text() if item else "")
-                lines.append("\t".join(row_data))
-            return "\n".join(lines)
+        tbl = self.L.table
+        cols = [tbl.horizontalHeaderItem(c).text() for c in range(tbl.columnCount())]
+        rows = []
+        for src in (self.L.table, self.R.table):
+            for r in range(src.rowCount()):
+                rows.append([
+                    (src.item(r, c).text() if src.item(r, c) else "")
+                    for c in range(src.columnCount())
+                ])
+        rows.sort(key=lambda row: (int(row[0]) if row[0].isdigit() else 0, int(row[1]) if row[1].isdigit() else 0))
 
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(table_to_text(self.L.table, "=== Left EMG ==="))
-            f.write("\n\n")
-            f.write(table_to_text(self.R.table, "=== Right EMG ==="))
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(cols)
+            writer.writerows(rows)
+
+    def _on_clear_all(self):
+        from PyQt5.QtWidgets import QMessageBox
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Clear")
+        msg.setText("This will clear all data. Are you sure?")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.No)
+        if msg.exec_() != QMessageBox.Yes:
+            return
+
+        if self.is_running:
+            self._stop()
+
+        for s in (self.L, self.R):
+            s.table.setRowCount(0)
+            s.hunt_num = 0
+            s.hunt_den = 0
+            s.hunt_history.clear()
+            s.hunt_num_lbl.setText("0")
+            s.hunt_den_lbl.setText("0")
+            s.curve.setData([], [])
+
+        self._clear_trigger_lines()
+        self.trigger_times.clear()
+        self._next_trial_num = 1
+        self.trigger_spin.blockSignals(True)
+        self.trigger_spin.setValue(0)
+        self.trigger_spin.setMaximum(9999)
+        self.trigger_spin.blockSignals(False)
+
+        if self._plot_window is not None:
+            self._plot_window.close()
+            self._plot_window = None
 
     def _make_data_table(self):
-        cols = ["Channel", "Loc ID", "%MSO1", "Trial", "MEP amp", "Prestim RMS"]
+        cols = ["Trial", "CH", "Hand", "Paralysis", "Loc_ID", "MSO1", "MSO2", "ISI", "MEP_amp", "Prestim_mean", "Temp", "Mode", "Excl"]
         tbl = QTableWidget(0, len(cols))
         tbl.setHorizontalHeaderLabels(cols)
-        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        tbl.horizontalHeader().setStretchLastSection(False)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         tbl.verticalHeader().setVisible(False)
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setSelectionBehavior(QTableWidget.SelectRows)
@@ -872,6 +1698,25 @@ class RealTimeViewer(QMainWindow):
     def _both_hunt_active(self):
         return all(s.hunt_panel.isEnabled() and s.hunt_chk.isChecked() for s in (self.L, self.R))
 
+    def _get_hand(self, s):
+        if self.ch_info and s.ch < len(self.ch_info):
+            name = self.ch_info[s.ch][0].lower()
+            if "right" in name:
+                return "RH"
+            if "left" in name:
+                return "LH"
+        return "NA"
+
+    def _get_paralysis(self, s):
+        ph_side = self._paralysis_combo.currentText()  # "NA", "LEFT", "RIGHT"
+        if ph_side == "NA":
+            return "NA"
+        hand = self._get_hand(s)
+        if hand == "NA":
+            return "NA"
+        hand_side = "LEFT" if hand == "LH" else "RIGHT"
+        return "PH" if hand_side == ph_side else "NPH"
+
     def _on_hunt_clear(self, side):
         targets = (self.L, self.R) if self._both_hunt_active() else (self.L if side == "left" else self.R,)
         for s in targets:
@@ -974,6 +1819,7 @@ class RealTimeViewer(QMainWindow):
             t1 = temp["temp1"] / 10.0
             t2 = temp["temp2"] / 10.0
             avg_c = (t1 + t2) / 2.0
+            self._temp_val = f"{avg_c:.1f}"
             self.lbl_magstim_temp.setText(f"{avg_c:.1f}°C")
             self.lbl_magstim_temp.setToolTip(
                 f"Coil1: {t1:.1f}°C    Coil2: {t2:.1f}°C"
@@ -982,16 +1828,25 @@ class RealTimeViewer(QMainWindow):
         self._mso1_val = params["power_a"]
         self.lbl_mso_val.setText(str(params["power_a"]))
         if self._magstim_mode == "DM":
+            self._mso2_val = params["power_b"]
+            self._isi_val  = f"{params['ipi'] / 10.0:.1f}"
             self.lbl_mso2_val.setText(str(params["power_b"]))
             self.lbl_isi_val.setText(f"{params['ipi'] / 10.0:.1f} ms")
+        else:
+            self._mso2_val = 0
+            self._isi_val  = "—"
 
     def closeEvent(self, event):
+        if self.is_running:
+            self._stop()
         self._magstim_stop.set()
         if self._magstim_port is not None:
             try:
                 self._magstim_port.close()
             except Exception:
                 pass
+        if self._plot_window is not None:
+            self._plot_window.close()
         super().closeEvent(event)
 
     def _on_separate_toggled(self, checked):
@@ -1031,6 +1886,17 @@ class RealTimeViewer(QMainWindow):
         name, unit = self.ch_info[idx]
         s.plot.setTitle(f"<b>{name}</b>", color=s.color, size="11pt")
         s.plot.setLabel("left", unit)
+        self._update_combo_exclusion()
+
+    def _update_combo_exclusion(self):
+        """Disable in each combo the channel currently shown by the other side."""
+        if not self.ch_info:
+            return
+        for own, other in ((self.L, self.R), (self.R, self.L)):
+            for i in range(own.combo.count()):
+                item = own.combo.model().item(i)
+                if item is not None:
+                    item.setEnabled(i != other.ch)
 
     # ------------------------------------------------------------------
     # COM event pump & trigger handler
@@ -1249,21 +2115,40 @@ class RealTimeViewer(QMainWindow):
         for s in (self.L, self.R):
             s.hunt_latest_eval  = False
             s.table_latest_eval = False
-        loc_id  = self.spin_location.value()
-        mso_pct = self._mso1_val
+        loc_id   = self.spin_location.value()
+        mso2_str = str(self._mso2_val) if self._magstim_mode == "DM" else "0"
+        isi_str  = self._isi_val if self._magstim_mode == "DM" else "0"
+        row_vals = [
+            lambda s: str(trial_num),
+            lambda s: str(s.ch + 1),
+            lambda s: self._get_hand(s),
+            lambda s: self._get_paralysis(s),
+            lambda s: str(loc_id),
+            lambda s: str(self._mso1_val),
+            lambda s: mso2_str,
+            lambda s: isi_str,
+            lambda s: "0",          # MEP_amp  (col 8)
+            lambda s: "0",          # Prestim_mean (col 9)
+            lambda s: self._temp_val if self._temp_val != "—" else "0",
+            lambda s: self._magstim_mode,
+        ]
         for s in (self.L, self.R):
             row = s.table.rowCount()
             s.table.insertRow(row)
-            for col, val in enumerate([str(s.ch + 1), str(loc_id), str(mso_pct), str(trial_num), "—", "—"]):
-                item = QTableWidgetItem(val)
+            for col, fn in enumerate(row_vals):
+                item = QTableWidgetItem(fn(s))
                 item.setTextAlignment(Qt.AlignCenter)
                 s.table.setItem(row, col, item)
+            excl_item = QTableWidgetItem("0")
+            excl_item.setTextAlignment(Qt.AlignCenter)
+            s.table.setItem(row, len(row_vals), excl_item)
             s.table.scrollToBottom()
         for s in (self.L, self.R):
             if s.hunt_panel.isEnabled() and s.hunt_chk.isChecked():
                 s.hunt_history.append((s.hunt_num, s.hunt_den))
                 s.hunt_den += 1
                 self._update_hunt_display("left" if s is self.L else "right")
+        self._sync_plot_table()
 
     def _open_labchart(self):
         search_dir = Path(__file__).parent
@@ -1388,11 +2273,15 @@ class RealTimeViewer(QMainWindow):
                     s.hunt_latest_eval = True
 
             row = selected_row
+            updated = False
             for s, r in ((self.L, r_L), (self.R, r_R)):
                 if not s.table_latest_eval and r is not None:
-                    self._set_table_cell(s.table, row, 4, f"{r['mep_amp']:.3f} mV")
-                    self._set_table_cell(s.table, row, 5, f"{r['prestim_rms']:.3f} mV")
+                    self._set_table_cell(s.table, row, 8, f"{r['mep_amp']:.3f}")
+                    self._set_table_cell(s.table, row, 9, f"{r['prestim_rms']:.3f}")
                     s.table_latest_eval = True
+                    updated = True
+            if updated:
+                self._sync_plot_table()
 
     # ------------------------------------------------------------------
     # Trigger lines
