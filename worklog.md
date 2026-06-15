@@ -2,6 +2,54 @@
 
 ---
 
+## 2026-06-15
+
+### ActiveWindow — MVC / Hold Task popup (realtime_viewer.py)
+
+#### Layout & UI
+- Added "Maximum Voluntary Contraction" title at top; switches to "Hold Task" when Hold task is checked
+- 3-column target row: left inputs | "targets" label | right inputs (each column center-aligned)
+- Horizontal divider line between avg stats and Hold task section
+- Y axis label parentheses removed (`<-` / `->`)
+- LabChart status "RUNNING" → "PLAY"
+
+#### Stats & History
+- n counter starts from 1 during first streaming trial (was showing 0)
+- avg MAX / MIN shown as clickable buttons → copies value; adjacent editable QLineEdit for manual override
+- Per-side Redo buttons; Redo blocked while Hold task is active
+
+#### Switch mode
+- Normal click: toggles left-only ↔ right-only only
+- Shift+click: both-channel mode (`<--->`)
+- Button tooltip explains the two modes
+- Status/countdown text only shown on active side(s)
+
+#### Y axis
+- Per-side Y axis spinbox (hidden/shown per switch mode)
+- WAIT/GO/RELAX text repositioned proportionally when Y max changes
+
+#### Hold Task mode
+- Checkbox enabled only when active side(s) have avg MAX measured
+- On check: title → "Hold Task", MVC button → "HOLD", channels/Y axis/Redo disabled
+- Y axis auto-set to 0–100 (%MVC); ball position converted to (raw / avg_MAX × 100)
+- Auto-applies default targets (50% ± 10%) and sets duration to 0 (infinite)
+- On uncheck: everything restored, target bands cleared
+- Switch blocked with warning if target side lacks MVC data
+
+#### Target bands
+- Per-side: `[50 %] ± [10 %] [APPLY]` — no spinbox arrows, centered
+- APPLY draws gray semi-transparent horizontal band + thick white center line on graph (0–100 axis)
+- Ball turns green inside band, red outside (during HOLD streaming)
+- Bands cleared on Hold task uncheck
+
+#### Streaming behavior
+- Duration 0 = infinite (no countdown shown); range 0–999 s; default 10 s
+- HOLD mode: no stats commit on stop, no "GO" instruction shown
+- F1 shortcut: MVC/HOLD/Stop button; F2 shortcut: Switch button
+- Ball size increased 22 → 26 px
+
+---
+
 ## 2026-06-05
 
 ### Window & Layout

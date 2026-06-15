@@ -55,6 +55,10 @@ class LabChartClient:
     def add_comment(self, text):
         self.doc.AppendComment(text)
 
+    def play_message(self, hex_str: str):
+        """Send an FRO configuration to LabChart via PlayMessage."""
+        self.doc.PlayMessage(hex_str)
+
     def start_sampling(self):
         self.doc.StartSampling(0, False, 0)
 

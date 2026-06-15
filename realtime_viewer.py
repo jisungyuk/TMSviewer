@@ -13,27 +13,27 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QLabel, QSpinBox, QApplication,
     QRadioButton, QButtonGroup, QDoubleSpinBox, QCheckBox, QAbstractSpinBox, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView, QGraphicsOpacityEffect, QStackedWidget,
-    QTabBar, QToolTip,
+    QTabBar, QToolTip, QLineEdit, QShortcut,
 )
+from PyQt5.QtGui import QFont, QColor, QCursor, QKeySequence
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal
-from PyQt5.QtGui import QFont, QColor, QCursor
 
 try:
     import serial
-    from magstim_test import disable_remote, get_parameters, get_temperature
+    import serial.tools.list_ports
+    from magstim_test import enable_remote, disable_remote, get_parameters, get_temperature
     _SERIAL_AVAILABLE = True
 except ImportError:
     _SERIAL_AVAILABLE = False
 
 from labchart_client import LabChartClient
 
-LABCHART_FILE = "MainDQ.adicht"
 
 WINDOW_SECS_DEFAULT = 4
 WINDOW_SECS_MIN = 4
 WINDOW_SECS_MAX = 15
-SCOPE_PRE_DEFAULT = 0.2
-SCOPE_POST_DEFAULT = 0.8
+SCOPE_PRE_DEFAULT = 0.15
+SCOPE_POST_DEFAULT = 0.35
 
 UPDATE_MS = 100
 STATUS_MS = 1000
@@ -51,6 +51,11 @@ TRIGGER_REFRACTORY = 0.5  # s — minimum gap between consecutive triggers
 
 MAGSTIM_PORT = "COM7"
 MAGSTIM_POLL_MS = 1000
+
+TRIGGERBOX_PORT    = "COM5"
+TRIGGERBOX_BAUD    = 115200
+TRIGGERBOX_CHANNEL = 1      # ch1 = 0x01; wired to LabChart ch5
+TRIGGERBOX_PULSE_MS = 100
 
 
 
@@ -192,6 +197,842 @@ class CalculatorWindow(QWidget):
             self._table.model().index(0, idx_100),
             QTableWidget.PositionAtCenter
         )
+
+
+class ActiveWindow(QWidget):
+    """Always-on-top popup: two streaming graphs with channel selectors and middle controls."""
+
+    _DEFAULT_LEFT  = 10   # CH11 (0-indexed)
+    _DEFAULT_RIGHT = 11   # CH12 (0-indexed)
+
+    def __init__(self, viewer, parent=None):
+        super().__init__(parent, Qt.Window)
+        self._viewer   = viewer
+        self._resizing = False
+        self.setWindowTitle("TMSviewer — Active")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.resize(992, 558)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(4)
+
+        self.lbl_window_title = QLabel("Maximum Voluntary Contraction")
+        title_font = QFont(); title_font.setPointSize(11); title_font.setBold(True)
+        self.lbl_window_title.setFont(title_font)
+        self.lbl_window_title.setAlignment(Qt.AlignCenter)
+        root.addWidget(self.lbl_window_title)
+
+        # ── top row: channel selectors + arrow ────────────────────────────
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+
+        self.combo_ch_left  = QComboBox()
+        self.combo_ch_right = QComboBox()
+        top_row.addWidget(self.combo_ch_left,  stretch=5)
+        top_row.addStretch(1)
+        top_row.addStretch(1)
+        top_row.addWidget(self.combo_ch_right, stretch=5)
+        root.addLayout(top_row)
+        self.populate_ch_combos()
+
+        # ── main row: left graph | middle buttons | right graph ────────────
+        main_row = QHBoxLayout()
+        main_row.setSpacing(8)
+
+        self.plot_left = pg.PlotWidget()
+        self.plot_right = pg.PlotWidget()
+        for plt in (self.plot_left, self.plot_right):
+            plt.setBackground("k")
+            plt.setXRange(0, 1)
+            plt.setYRange(0, 1)
+            plt.getAxis("bottom").hide()
+            plt.getAxis("left").setTextPen("w")
+            plt.showGrid(x=False, y=True, alpha=0.2)
+            plt.setMouseEnabled(x=False, y=False)
+
+        self._ball_left  = pg.ScatterPlotItem([0.5], [0.0],
+            pen=None, brush=pg.mkBrush(140, 140, 140), size=26, symbol='o')
+        self._ball_right = pg.ScatterPlotItem([0.5], [0.0],
+            pen=None, brush=pg.mkBrush(140, 140, 140), size=26, symbol='o')
+        self.plot_left.addItem(self._ball_left)
+        self.plot_right.addItem(self._ball_right)
+
+        txt_font = QFont(); txt_font.setPointSize(18); txt_font.setBold(True)
+        self._status_txt_l   = pg.TextItem("WAIT", color="w", anchor=(0.5, 0))
+        self._status_txt_r   = pg.TextItem("WAIT", color="w", anchor=(0.5, 0))
+        self._countdown_txt_l = pg.TextItem("",    color="w", anchor=(0.5, 0))
+        self._countdown_txt_r = pg.TextItem("",    color="w", anchor=(0.5, 0))
+        for t in (self._status_txt_l, self._status_txt_r,
+                  self._countdown_txt_l, self._countdown_txt_r):
+            t.setFont(txt_font)
+        self._status_txt_l.setPos(0.5,    self._STATUS_YFRAC)
+        self._status_txt_r.setPos(0.5,    self._STATUS_YFRAC)
+        self._countdown_txt_l.setPos(0.5, self._COUNTDOWN_YFRAC)
+        self._countdown_txt_r.setPos(0.5, self._COUNTDOWN_YFRAC)
+        self.plot_left.addItem(self._status_txt_l)
+        self.plot_left.addItem(self._countdown_txt_l)
+        self.plot_right.addItem(self._status_txt_r)
+        self.plot_right.addItem(self._countdown_txt_r)
+
+        self._val_left   = 0.0
+        self._val_right  = 0.0
+        self._streaming  = False
+        self._switch_mode = 1   # 0=both, 1=left only, 2=right only
+        self._band_left      = None
+        self._band_line_left = None
+        self._band_right     = None
+        self._band_line_right= None
+        self._history_left  = []   # [(max, min), ...]
+        self._history_right = []
+        self._cur_max_left  = None
+        self._cur_min_left  = None
+        self._cur_max_right = None
+        self._cur_min_right = None
+        self._task_end_t = 0.0
+        self._fade_start_val_l = 0.0
+        self._fade_start_val_r = 0.0
+        self._fade_elapsed     = 0.0
+
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setInterval(50)
+        self._stream_timer.timeout.connect(self._on_stream_tick)
+
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setInterval(50)
+        self._fade_timer.timeout.connect(self._on_fade_tick)
+
+        self._lc_status_timer = QTimer(self)
+        self._lc_status_timer.setInterval(1000)
+        self._lc_status_timer.timeout.connect(self._poll_lc_status)
+        self._lc_status_timer.start()
+
+        mid_col = QVBoxLayout()
+        mid_col.setSpacing(8)
+        mid_col.setContentsMargins(4, 0, 4, 0)
+
+        self.lbl_lc_status = QLabel("● —")
+        self.lbl_lc_status.setAlignment(Qt.AlignCenter)
+        lc_font = QFont(); lc_font.setPointSize(9); lc_font.setBold(True)
+        self.lbl_lc_status.setFont(lc_font)
+        self.lbl_lc_status.setStyleSheet("color: gray;")
+
+        self.arrow_lbl = QLabel("<---")
+        self.arrow_lbl.setAlignment(Qt.AlignCenter)
+        arrow_font = QFont(); arrow_font.setPointSize(14); arrow_font.setBold(True)
+        self.arrow_lbl.setFont(arrow_font)
+
+        self.btn_switch = QPushButton("Switch")
+        self.btn_switch.setFixedWidth(90)
+        self.btn_switch.setToolTip(
+            "Click: toggle left / right channel\n"
+            "Shift + Click: both channels"
+        )
+        self.btn_switch.clicked.connect(self._on_switch_clicked)
+        self.btn_mvc    = QPushButton("MVC")
+        self.btn_mvc.setFixedWidth(90)
+        self.btn_mvc.clicked.connect(self._on_mvc_clicked)
+        dur_lbl = QLabel("Duration")
+        dur_lbl.setAlignment(Qt.AlignCenter)
+        self.spin_duration = QSpinBox()
+        self.spin_duration.setRange(0, 999)
+        self.spin_duration.setValue(10)
+        self.spin_duration.setSuffix(" s")
+        self.spin_duration.setFixedWidth(72)
+
+        self._lbl_yaxis_header = QLabel("Y axis  (<-)")
+        self._lbl_yaxis_header.setAlignment(Qt.AlignCenter)
+
+        self._lbl_ydir_right_hdr = QLabel("->")
+        self._lbl_ydir_right_hdr.setAlignment(Qt.AlignCenter)
+
+        self.spin_yaxis_left  = QDoubleSpinBox()
+        self.spin_yaxis_right = QDoubleSpinBox()
+        for sp in (self.spin_yaxis_left, self.spin_yaxis_right):
+            sp.setRange(0.01, 1000.0)
+            sp.setValue(1.0)
+            sp.setDecimals(2)
+            sp.setSingleStep(0.1)
+            sp.setFixedWidth(72)
+        self.spin_yaxis_left.valueChanged.connect(
+            lambda v: (self.plot_left.setYRange(0, v),
+                       self._reposition_texts("left", v)))
+        self.spin_yaxis_right.valueChanged.connect(
+            lambda v: (self.plot_right.setYRange(0, v),
+                       self._reposition_texts("right", v)))
+
+        mid_col.addWidget(self.lbl_lc_status,  alignment=Qt.AlignHCenter)
+        mid_col.addWidget(self.arrow_lbl,       alignment=Qt.AlignHCenter)
+        mid_col.addSpacing(4)
+        mid_col.addWidget(self.btn_switch,      alignment=Qt.AlignHCenter)
+        mid_col.addWidget(self.btn_mvc,         alignment=Qt.AlignHCenter)
+        mid_col.addSpacing(6)
+        mid_col.addWidget(dur_lbl,              alignment=Qt.AlignHCenter)
+        mid_col.addWidget(self.spin_duration,   alignment=Qt.AlignHCenter)
+        mid_col.addSpacing(6)
+        mid_col.addWidget(self._lbl_yaxis_header,    alignment=Qt.AlignHCenter)
+        mid_col.addWidget(self.spin_yaxis_left,      alignment=Qt.AlignHCenter)
+        mid_col.addWidget(self._lbl_ydir_right_hdr,  alignment=Qt.AlignHCenter)
+        mid_col.addWidget(self.spin_yaxis_right,     alignment=Qt.AlignHCenter)
+        mid_col.addStretch()
+        self._update_yaxis_ui()
+
+        QShortcut(QKeySequence("F1"), self, activated=self.btn_mvc.click)
+        QShortcut(QKeySequence("F2"), self, activated=self.btn_switch.click)
+
+        main_row.addWidget(self.plot_left,  stretch=5)
+        main_row.addLayout(mid_col)
+        main_row.addWidget(self.plot_right, stretch=5)
+        root.addLayout(main_row, stretch=1)
+
+        # ── stats / avg rows ───────────────────────────────────────────────
+        stats_font = QFont(); stats_font.setPointSize(9)
+        _sel = Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+        _REDO_W = 46
+
+        def _stat_label(text=""):
+            lbl = QLabel(text)
+            lbl.setFont(stats_font)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setTextInteractionFlags(_sel)
+            return lbl
+
+        self.lbl_stats_left  = _stat_label("n= —    MAX: —    MIN: —")
+        self.lbl_stats_right = _stat_label("n= —    MAX: —    MIN: —")
+        self._avg_max_left  = None
+        self._avg_min_left  = None
+        self._avg_max_right = None
+        self._avg_min_right = None
+
+        self.btn_redo_left  = QPushButton("Redo")
+        self.btn_redo_right = QPushButton("Redo")
+        for btn in (self.btn_redo_left, self.btn_redo_right):
+            btn.setFixedWidth(_REDO_W)
+            btn.setEnabled(False)
+        self.btn_redo_left.clicked.connect(lambda: self._on_redo_clicked("left"))
+        self.btn_redo_right.clicked.connect(lambda: self._on_redo_clicked("right"))
+
+        stats_row = QHBoxLayout()
+        stats_row.setContentsMargins(0, 0, 0, 0)
+        stats_row.setSpacing(4)
+        stats_row.addWidget(self.lbl_stats_left,  stretch=5)
+        stats_row.addWidget(self.btn_redo_left)
+        stats_row.addStretch(1)
+        stats_row.addWidget(self.btn_redo_right)
+        stats_row.addWidget(self.lbl_stats_right, stretch=5)
+        root.addLayout(stats_row)
+
+        _btn_avg_style = (
+            "QPushButton { border: 1px solid #555; border-radius: 3px; "
+            "padding: 1px 6px; background: #252525; color: #ccc; font-size: 9pt; }"
+            "QPushButton:hover { background: #333; color: #fff; }"
+        )
+        _edit_avg_style = (
+            "QLineEdit { border: 1px solid #555; border-radius: 3px; "
+            "padding: 1px 4px; background: #1a1a1a; color: #eee; font-size: 9pt; }"
+        )
+
+        def _avg_side_layout(max_btn_attr, max_edit_attr, min_btn_attr, min_edit_attr, side):
+            lay = QHBoxLayout()
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(3)
+            lay.addStretch()
+            for btn_attr, edit_attr, kind in (
+                (max_btn_attr, max_edit_attr, "max"),
+                (min_btn_attr, min_edit_attr, "min"),
+            ):
+                lbl_kind = "MAX" if kind == "max" else "MIN"
+                btn = QPushButton(lbl_kind)
+                btn.setFixedWidth(46)
+                btn.setStyleSheet(_btn_avg_style)
+                btn.setToolTip(f"Click to copy {lbl_kind} value")
+                edit = QLineEdit()
+                edit.setPlaceholderText("—")
+                edit.setStyleSheet(_edit_avg_style)
+                edit.setFixedWidth(72)
+                edit.setAlignment(Qt.AlignCenter)
+                btn.clicked.connect(lambda checked=False, e=edit: self._copy_edit(e))
+                setattr(self, btn_attr,  btn)
+                setattr(self, edit_attr, edit)
+                lay.addWidget(btn)
+                lay.addWidget(edit)
+            lay.addStretch()
+            return lay
+
+        avg_row = QHBoxLayout()
+        avg_row.setContentsMargins(0, 0, 0, 0)
+        avg_row.setSpacing(4)
+        avg_row.addLayout(_avg_side_layout(
+            "btn_avg_max_left",  "edit_avg_max_left",
+            "btn_avg_min_left",  "edit_avg_min_left",  "left"),  stretch=5)
+        avg_row.addSpacing(_REDO_W)
+        avg_row.addStretch(1)
+        avg_row.addSpacing(_REDO_W)
+        avg_row.addLayout(_avg_side_layout(
+            "btn_avg_max_right", "edit_avg_max_right",
+            "btn_avg_min_right", "edit_avg_min_right", "right"), stretch=5)
+        root.addLayout(avg_row)
+
+        # ── divider ────────────────────────────────────────────────────────
+        divider = QFrame()
+        divider.setFrameShape(QFrame.HLine)
+        divider.setFrameShadow(QFrame.Sunken)
+        root.addWidget(divider)
+
+        # ── Hold task checkbox ─────────────────────────────────────────────
+        hold_row = QHBoxLayout()
+        hold_row.setContentsMargins(0, 0, 0, 0)
+        self.chk_hold_task = QCheckBox("Hold task")
+        hold_font = QFont(); hold_font.setPointSize(9); hold_font.setBold(True)
+        self.chk_hold_task.setFont(hold_font)
+        self.chk_hold_task.setEnabled(False)
+        self.chk_hold_task.toggled.connect(self._on_hold_task_toggled)
+        hold_row.addStretch()
+        hold_row.addWidget(self.chk_hold_task)
+        hold_row.addStretch()
+        root.addLayout(hold_row)
+
+        # ── Target row ─────────────────────────────────────────────────────
+        _tgt_style = (
+            "QDoubleSpinBox { border: 1px solid #555; border-radius: 3px; "
+            "padding: 1px 3px; background: #1a1a1a; color: #eee; font-size: 9pt; }"
+        )
+        _tgt_btn_style = (
+            "QPushButton { border: 1px solid #555; border-radius: 3px; "
+            "padding: 2px 8px; background: #252525; color: #ccc; font-size: 9pt; }"
+            "QPushButton:hover { background: #333; color: #fff; }"
+            "QPushButton:disabled { color: #555; background: #1a1a1a; }"
+        )
+
+        def _make_target_side(pct_attr, tol_attr, btn_attr):
+            w = QWidget()
+            lay = QHBoxLayout(w)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(4)
+            spin_pct = QDoubleSpinBox()
+            spin_pct.setRange(0.0, 200.0)
+            spin_pct.setValue(50.0)
+            spin_pct.setDecimals(1)
+            spin_pct.setSuffix(" %")
+            spin_pct.setFixedWidth(68)
+            spin_pct.setStyleSheet(_tgt_style)
+            spin_pct.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            lbl_pm = QLabel("±")
+            lbl_pm.setAlignment(Qt.AlignCenter)
+            spin_tol = QDoubleSpinBox()
+            spin_tol.setRange(0.0, 100.0)
+            spin_tol.setValue(10.0)
+            spin_tol.setDecimals(1)
+            spin_tol.setSuffix(" %")
+            spin_tol.setFixedWidth(62)
+            spin_tol.setStyleSheet(_tgt_style)
+            spin_tol.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            btn = QPushButton("APPLY")
+            btn.setFixedWidth(68)
+            btn.setStyleSheet(_tgt_btn_style)
+            setattr(self, pct_attr, spin_pct)
+            setattr(self, tol_attr, spin_tol)
+            setattr(self, btn_attr,  btn)
+            lay.addWidget(spin_pct)
+            lay.addWidget(lbl_pm)
+            lay.addWidget(spin_tol)
+            lay.addWidget(btn)
+            w.setEnabled(False)
+            return w
+
+        self._tgt_widget_left  = _make_target_side(
+            "spin_tgt_pct_left",  "spin_tgt_tol_left",  "btn_apply_left")
+        self._tgt_widget_right = _make_target_side(
+            "spin_tgt_pct_right", "spin_tgt_tol_right", "btn_apply_right")
+        self.btn_apply_left.clicked.connect(lambda: self._on_apply_clicked("left"))
+        self.btn_apply_right.clicked.connect(lambda: self._on_apply_clicked("right"))
+
+        lbl_targets = QLabel("targets")
+        lbl_targets.setAlignment(Qt.AlignCenter)
+        lbl_targets_font = QFont(); lbl_targets_font.setPointSize(9)
+        lbl_targets.setFont(lbl_targets_font)
+
+        def _centered_col(widget):
+            col = QHBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.addStretch()
+            col.addWidget(widget)
+            col.addStretch()
+            return col
+
+        target_row = QHBoxLayout()
+        target_row.setContentsMargins(0, 2, 0, 0)
+        target_row.setSpacing(0)
+        target_row.addLayout(_centered_col(self._tgt_widget_left),  stretch=1)
+        target_row.addLayout(_centered_col(lbl_targets),            stretch=1)
+        target_row.addLayout(_centered_col(self._tgt_widget_right), stretch=1)
+        root.addLayout(target_row)
+
+    def populate_ch_combos(self):
+        ch_info = getattr(self._viewer, "ch_info", None)
+        for cb, default in ((self.combo_ch_left,  self._DEFAULT_LEFT),
+                            (self.combo_ch_right, self._DEFAULT_RIGHT)):
+            cb.blockSignals(True)
+            cb.clear()
+            if ch_info:
+                for i, (name, unit) in enumerate(ch_info):
+                    cb.addItem(f"Ch{i + 1}  {name}  [{unit}]")
+            else:
+                for i in range(1, 17):
+                    cb.addItem(f"Ch{i}")
+            cb.setCurrentIndex(min(default, cb.count() - 1))
+            cb.blockSignals(False)
+
+    def _set_status(self, text, color):
+        if self._switch_mode != 2:
+            self._status_txt_l.setText(text)
+            self._status_txt_l.setColor(color)
+        else:
+            self._status_txt_l.setText("")
+        if self._switch_mode != 1:
+            self._status_txt_r.setText(text)
+            self._status_txt_r.setColor(color)
+        else:
+            self._status_txt_r.setText("")
+
+    def _set_countdown(self, text):
+        if self._switch_mode != 2:
+            self._countdown_txt_l.setText(text)
+        else:
+            self._countdown_txt_l.setText("")
+        if self._switch_mode != 1:
+            self._countdown_txt_r.setText(text)
+        else:
+            self._countdown_txt_r.setText("")
+
+    def _set_ball_color(self, r, g, b):
+        brush = pg.mkBrush(r, g, b)
+        self._ball_left.setBrush(brush)
+        self._ball_right.setBrush(brush)
+
+    _STATUS_YFRAC    = 0.96
+    _COUNTDOWN_YFRAC = 0.82
+
+    def _reposition_texts(self, side, y_max):
+        if side == "left":
+            self._status_txt_l.setPos(0.5,    y_max * self._STATUS_YFRAC)
+            self._countdown_txt_l.setPos(0.5, y_max * self._COUNTDOWN_YFRAC)
+        else:
+            self._status_txt_r.setPos(0.5,    y_max * self._STATUS_YFRAC)
+            self._countdown_txt_r.setPos(0.5, y_max * self._COUNTDOWN_YFRAC)
+
+    def _update_yaxis_ui(self):
+        mode = self._switch_mode
+        _headers = {0: "Y axis  <-", 1: "Y axis  <-", 2: "Y axis  ->"}
+        self._lbl_yaxis_header.setText(_headers[mode])
+        self.spin_yaxis_left.setVisible(mode == 0 or mode == 1)
+        self._lbl_ydir_right_hdr.setVisible(mode == 0)
+        self.spin_yaxis_right.setVisible(mode == 0 or mode == 2)
+
+    def _on_switch_clicked(self):
+        if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+            new_mode = 0
+        else:
+            new_mode = 2 if self._switch_mode == 1 else 1
+
+        if self.chk_hold_task.isChecked():
+            from PyQt5.QtWidgets import QMessageBox
+            has_l = bool(self.edit_avg_max_left.text().strip())
+            has_r = bool(self.edit_avg_max_right.text().strip())
+            if new_mode == 1 and not has_l:
+                QMessageBox.warning(self, "Hold Task",
+                    "Left side MVC not measured.\nPlease complete left side MVC first.")
+                return
+            if new_mode == 2 and not has_r:
+                QMessageBox.warning(self, "Hold Task",
+                    "Right side MVC not measured.\nPlease complete right side MVC first.")
+                return
+            if new_mode == 0 and not (has_l and has_r):
+                QMessageBox.warning(self, "Hold Task",
+                    "Both sides need MVC measurements to use both-channel mode.")
+                return
+
+        self._switch_mode = new_mode
+        arrows = ["<--->", "<---", "--->"]
+        self.arrow_lbl.setText(arrows[self._switch_mode])
+        # freeze the inactive side immediately
+        if self._switch_mode == 1:   # left only → reset right
+            self._val_right = 0.0
+            self._ball_right.setData([0.5], [0.0])
+        elif self._switch_mode == 2: # right only → reset left
+            self._val_left = 0.0
+            self._ball_left.setData([0.5], [0.0])
+        self._update_yaxis_ui()
+        self._check_hold_task_availability()
+        self._update_target_enabled()
+
+    def _commit_trial(self):
+        if self._cur_max_left is not None:
+            self._history_left.append((self._cur_max_left, self._cur_min_left))
+        if self._cur_max_right is not None:
+            self._history_right.append((self._cur_max_right, self._cur_min_right))
+        self._cur_max_left = self._cur_min_left = None
+        self._cur_max_right = self._cur_min_right = None
+        self.btn_redo_left.setEnabled(bool(self._history_left))
+        self.btn_redo_right.setEnabled(bool(self._history_right))
+
+    def _on_mvc_clicked(self):
+        _hold = self.chk_hold_task.isChecked()
+        if self._streaming:
+            # Stop pressed — immediately go to RELAX
+            self._stream_timer.stop()
+            self._streaming = False
+            if not _hold:
+                self._commit_trial()
+            self._fade_start_val_l = self._val_left
+            self._fade_start_val_r = self._val_right
+            self._fade_elapsed     = 0.0
+            self.btn_mvc.setText("HOLD" if _hold else "MVC")
+            self._set_ball_color(140, 140, 140)
+            self._set_status("RELAX", "w")
+            self._set_countdown("")
+            self._fade_timer.start()
+            return
+        client = getattr(self._viewer, "client", None)
+        if client is None:
+            return
+        self._streaming  = True
+        self._cur_max_left  = None
+        self._cur_min_left  = None
+        self._cur_max_right = None
+        self._cur_min_right = None
+        _dur = self.spin_duration.value()
+        self._task_end_t = float('inf') if _dur == 0 else time.time() + _dur
+        self._fade_timer.stop()
+        self.btn_mvc.setText("Stop")
+        self._set_ball_color(220, 30, 30)
+        if not _hold:
+            self._set_status("GO", (0, 200, 80))
+        else:
+            self._set_status("", "w")
+        self._stream_timer.start()
+
+    def _on_stream_tick(self):
+        client = getattr(self._viewer, "client", None)
+        if client is None or not self._streaming:
+            self._stream_timer.stop()
+            return
+
+        now = time.time()
+        if self._task_end_t != float('inf'):
+            secs_left = max(0.0, self._task_end_t - now)
+            self._set_countdown(f"{secs_left:.1f}")
+        else:
+            self._set_countdown("")
+
+        ch_l = self.combo_ch_left.currentIndex()
+        ch_r = self.combo_ch_right.currentIndex()
+        try:
+            data, _, _ = client.get_latest_data(window_secs=4.0,
+                                                  channels=[ch_l, ch_r])
+            for ch_idx, attr, active in (
+                (ch_l, "_val_left",  self._switch_mode != 2),
+                (ch_r, "_val_right", self._switch_mode != 1),
+            ):
+                if not active:
+                    continue
+                arr = data.get(ch_idx)
+                if arr is not None and len(arr):
+                    finite = arr[np.isfinite(arr)]
+                    n = len(finite)
+                    if n:
+                        nonzero_idx = np.flatnonzero(finite)
+                        if len(nonzero_idx):
+                            real_end  = int(nonzero_idx[-1]) + 1
+                            tail_size = max(1, n // 40)
+                            tail      = finite[max(0, real_end - tail_size):real_end]
+                            v = float(np.sqrt(np.mean(tail ** 2)))
+                        else:
+                            v = 0.0
+                        setattr(self, attr, v)
+        except Exception:
+            pass
+
+        _hold = self.chk_hold_task.isChecked()
+        if self._switch_mode != 2:
+            if _hold:
+                try:
+                    mx = float(self.edit_avg_max_left.text())
+                    ball_y_l = (self._val_left / mx * 100) if mx > 0 else 0.0
+                except ValueError:
+                    ball_y_l = self._val_left
+                # color: green inside band, red outside
+                if self._band_left is not None:
+                    pct = self.spin_tgt_pct_left.value()
+                    tol = self.spin_tgt_tol_left.value()
+                    in_band = (pct - tol) <= ball_y_l <= (pct + tol)
+                    self._ball_left.setBrush(
+                        pg.mkBrush(30, 200, 50) if in_band else pg.mkBrush(220, 30, 30))
+            else:
+                ball_y_l = self._val_left
+                v = self._val_left
+                self._cur_max_left = v if self._cur_max_left is None else max(self._cur_max_left, v)
+                self._cur_min_left = v if self._cur_min_left is None else min(self._cur_min_left, v)
+            self._ball_left.setData([0.5], [ball_y_l])
+        if self._switch_mode != 1:
+            if _hold:
+                try:
+                    mx = float(self.edit_avg_max_right.text())
+                    ball_y_r = (self._val_right / mx * 100) if mx > 0 else 0.0
+                except ValueError:
+                    ball_y_r = self._val_right
+                if self._band_right is not None:
+                    pct = self.spin_tgt_pct_right.value()
+                    tol = self.spin_tgt_tol_right.value()
+                    in_band = (pct - tol) <= ball_y_r <= (pct + tol)
+                    self._ball_right.setBrush(
+                        pg.mkBrush(30, 200, 50) if in_band else pg.mkBrush(220, 30, 30))
+            else:
+                ball_y_r = self._val_right
+                v = self._val_right
+                self._cur_max_right = v if self._cur_max_right is None else max(self._cur_max_right, v)
+                self._cur_min_right = v if self._cur_min_right is None else min(self._cur_min_right, v)
+            self._ball_right.setData([0.5], [ball_y_r])
+        if not _hold:
+            self._update_stats()
+
+        if now >= self._task_end_t:
+            _hold = self.chk_hold_task.isChecked()
+            self._stream_timer.stop()
+            self._streaming = False
+            if not _hold:
+                self._commit_trial()
+            self._fade_start_val_l = self._val_left
+            self._fade_start_val_r = self._val_right
+            self._fade_elapsed     = 0.0
+            self.btn_mvc.setText("HOLD" if _hold else "MVC")
+            self._set_ball_color(140, 140, 140)
+            self._set_status("RELAX", "w")
+            self._set_countdown("")
+            self._fade_timer.start()
+
+    _FADE_SECS = 1.0
+
+    def _on_fade_tick(self):
+        self._fade_elapsed += 0.05
+        t = min(self._fade_elapsed / self._FADE_SECS, 1.0)
+        self._val_left  = self._fade_start_val_l * (1.0 - t)
+        self._val_right = self._fade_start_val_r * (1.0 - t)
+        if self.chk_hold_task.isChecked():
+            try:
+                mx_l = float(self.edit_avg_max_left.text())
+                bl = (self._val_left  / mx_l * 100) if mx_l > 0 else 0.0
+            except ValueError:
+                bl = self._val_left
+            try:
+                mx_r = float(self.edit_avg_max_right.text())
+                br = (self._val_right / mx_r * 100) if mx_r > 0 else 0.0
+            except ValueError:
+                br = self._val_right
+        else:
+            bl, br = self._val_left, self._val_right
+        self._ball_left.setData( [0.5], [bl])
+        self._ball_right.setData([0.5], [br])
+        if t >= 1.0:
+            self._val_left  = 0.0
+            self._val_right = 0.0
+            self._fade_timer.stop()
+            self._set_status("WAIT", "w")
+
+    def _on_redo_clicked(self, side):
+        if self.chk_hold_task.isChecked():
+            return
+        if side == "left" and self._history_left:
+            self._history_left.pop()
+        elif side == "right" and self._history_right:
+            self._history_right.pop()
+        self.btn_redo_left.setEnabled(bool(self._history_left))
+        self.btn_redo_right.setEnabled(bool(self._history_right))
+        self._update_stats()
+
+    def _update_stats(self):
+        def _fmt(history, cur_max, cur_min):
+            n = len(history)
+            if self._streaming and cur_max is not None:
+                mx, mn = cur_max, cur_min
+                stats = f"n={n+1}*  MAX: {mx:.4f}  MIN: {mn:.4f}"
+            elif n > 0:
+                mx, mn = history[-1]
+                stats = f"n={n}   MAX: {mx:.4f}  MIN: {mn:.4f}"
+            else:
+                stats = "n= —    MAX: —    MIN: —"
+
+            all_entries = list(history)
+            if self._streaming and cur_max is not None:
+                all_entries.append((cur_max, cur_min))
+            if all_entries:
+                avg_mx = sum(h[0] for h in all_entries) / len(all_entries)
+                avg_mn = sum(h[1] for h in all_entries) / len(all_entries)
+            else:
+                avg_mx = avg_mn = None
+            return stats, avg_mx, avg_mn
+
+        s_l, amx_l, amn_l = _fmt(self._history_left,  self._cur_max_left,  self._cur_min_left)
+        s_r, amx_r, amn_r = _fmt(self._history_right, self._cur_max_right, self._cur_min_right)
+        self.lbl_stats_left.setText(s_l)
+        self.lbl_stats_right.setText(s_r)
+        self._avg_max_left  = amx_l
+        self._avg_min_left  = amn_l
+        self._avg_max_right = amx_r
+        self._avg_min_right = amn_r
+        if amx_l is not None:
+            self.edit_avg_max_left.setText(f"{amx_l:.4f}")
+        if amn_l is not None:
+            self.edit_avg_min_left.setText(f"{amn_l:.4f}")
+        if amx_r is not None:
+            self.edit_avg_max_right.setText(f"{amx_r:.4f}")
+        if amn_r is not None:
+            self.edit_avg_min_right.setText(f"{amn_r:.4f}")
+        self._check_hold_task_availability()
+
+    def _copy_edit(self, edit_widget):
+        text = edit_widget.text().strip()
+        if text:
+            QApplication.clipboard().setText(text)
+
+    def _check_hold_task_availability(self):
+        has_l = bool(self.edit_avg_max_left.text().strip())
+        has_r = bool(self.edit_avg_max_right.text().strip())
+        mode = self._switch_mode
+        if mode == 0:
+            available = has_l and has_r
+        elif mode == 1:
+            available = has_l
+        else:
+            available = has_r
+        if not available and self.chk_hold_task.isChecked():
+            self.chk_hold_task.setChecked(False)
+        self.chk_hold_task.setEnabled(available)
+
+    def _update_target_enabled(self):
+        if not self.chk_hold_task.isChecked():
+            return
+        left_active  = self._switch_mode != 2
+        right_active = self._switch_mode != 1
+        has_l = bool(self.edit_avg_max_left.text().strip())
+        has_r = bool(self.edit_avg_max_right.text().strip())
+        self.spin_tgt_pct_left.setEnabled(left_active)
+        self.spin_tgt_tol_left.setEnabled(left_active)
+        self.btn_apply_left.setEnabled(left_active and has_l)
+        self.spin_tgt_pct_right.setEnabled(right_active)
+        self.spin_tgt_tol_right.setEnabled(right_active)
+        self.btn_apply_right.setEnabled(right_active and has_r)
+
+    def _on_hold_task_toggled(self, checked):
+        if checked:
+            self.lbl_window_title.setText("Hold Task")
+            self.btn_mvc.setText("HOLD")
+            self.combo_ch_left.setEnabled(False)
+            self.combo_ch_right.setEnabled(False)
+            self.spin_yaxis_left.setEnabled(False)
+            self.spin_yaxis_right.setEnabled(False)
+            self.btn_redo_left.setEnabled(False)
+            self.btn_redo_right.setEnabled(False)
+            # %MVC mode: Y axis → 0–100 for both plots
+            self.plot_left.setYRange(0, 100)
+            self.plot_right.setYRange(0, 100)
+            self._reposition_texts("left",  100)
+            self._reposition_texts("right", 100)
+            self._tgt_widget_left.setEnabled(True)
+            self._tgt_widget_right.setEnabled(True)
+            self._update_target_enabled()
+            # auto-apply targets for sides with MVC set
+            if bool(self.edit_avg_max_left.text().strip()):
+                self._on_apply_clicked("left")
+            if bool(self.edit_avg_max_right.text().strip()):
+                self._on_apply_clicked("right")
+            self.spin_duration.setValue(0)
+        else:
+            self.lbl_window_title.setText("Maximum Voluntary Contraction")
+            self.btn_mvc.setText("MVC")
+            self.combo_ch_left.setEnabled(True)
+            self.combo_ch_right.setEnabled(True)
+            self.spin_yaxis_left.setEnabled(True)
+            self.spin_yaxis_right.setEnabled(True)
+            self.btn_redo_left.setEnabled(bool(self._history_left))
+            self.btn_redo_right.setEnabled(bool(self._history_right))
+            # restore Y range from spinboxes
+            v_l = self.spin_yaxis_left.value()
+            self.plot_left.setYRange(0, v_l)
+            self._reposition_texts("left", v_l)
+            v_r = self.spin_yaxis_right.value()
+            self.plot_right.setYRange(0, v_r)
+            self._reposition_texts("right", v_r)
+            self._tgt_widget_left.setEnabled(False)
+            self._tgt_widget_right.setEnabled(False)
+            self._clear_bands()
+
+    def _on_apply_clicked(self, side):
+        pct = getattr(self, f"spin_tgt_pct_{side}").value()
+        tol = getattr(self, f"spin_tgt_tol_{side}").value()
+        low  = max(0.0,   pct - tol)
+        high = min(100.0, pct + tol)
+        self._clear_band(side)
+        plot = self.plot_left if side == "left" else self.plot_right
+        band = pg.LinearRegionItem(
+            values=(low, high),
+            orientation="horizontal",
+            movable=False,
+            brush=pg.mkBrush(160, 160, 160, 55),
+            pen=pg.mkPen(180, 180, 180, 160, width=2),
+        )
+        band.setZValue(-10)
+        line = pg.InfiniteLine(
+            pos=pct, angle=0, movable=False,
+            pen=pg.mkPen(220, 220, 220, 230, width=3),
+        )
+        plot.addItem(band)
+        plot.addItem(line)
+        setattr(self, f"_band_{side}",      band)
+        setattr(self, f"_band_line_{side}", line)
+
+    def _clear_band(self, side):
+        plot = self.plot_left if side == "left" else self.plot_right
+        band = getattr(self, f"_band_{side}", None)
+        line = getattr(self, f"_band_line_{side}", None)
+        if band is not None:
+            plot.removeItem(band)
+            setattr(self, f"_band_{side}", None)
+        if line is not None:
+            plot.removeItem(line)
+            setattr(self, f"_band_line_{side}", None)
+
+    def _clear_bands(self):
+        self._clear_band("left")
+        self._clear_band("right")
+
+    def _poll_lc_status(self):
+        client = getattr(self._viewer, "client", None)
+        if client is None:
+            self.lbl_lc_status.setText("● —")
+            self.lbl_lc_status.setStyleSheet("color: gray;")
+            return
+        try:
+            if client.is_sampling():
+                self.lbl_lc_status.setText("● PLAY")
+                self.lbl_lc_status.setStyleSheet("color: #00cc44;")
+            else:
+                self.lbl_lc_status.setText("● STOP")
+                self.lbl_lc_status.setStyleSheet("color: #ff4444;")
+        except Exception:
+            self.lbl_lc_status.setText("● —")
+            self.lbl_lc_status.setStyleSheet("color: gray;")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._resizing:
+            return
+        self._resizing = True
+        w = event.size().width()
+        target_h = round(w * 9 / 16)
+        if event.size().height() != target_h:
+            self.resize(w, target_h)
+        self._resizing = False
 
 
 class PlotWindow(QWidget):
@@ -892,7 +1733,8 @@ class RealTimeViewer(QMainWindow):
         self._isi_val  = "—"
         self._temp_val = "—"
         self._magstim_polled.connect(self._on_magstim_polled)
-        self._plot_window = None
+        self._plot_window   = None
+        self._active_window = None
         self.window_secs   = WINDOW_SECS_DEFAULT
         self.scope_pre     = SCOPE_PRE_DEFAULT
         self.scope_post    = SCOPE_POST_DEFAULT
@@ -902,7 +1744,6 @@ class RealTimeViewer(QMainWindow):
         pg.setConfigOption("foreground", "k")
 
         self._setup_ui()
-        self._connect_magstim()
 
         self.data_timer = QTimer()
         self.data_timer.timeout.connect(self._update)
@@ -933,11 +1774,23 @@ class RealTimeViewer(QMainWindow):
         root.addLayout(self._make_plots_row(), stretch=1)
         root.addWidget(self._make_scope_below_stack())
 
+        _sf = QFont(); _sf.setPointSize(10)
+        status_row = QHBoxLayout()
         self.lbl_status = QLabel("Connecting to LabChart...")
         self.lbl_status.setAlignment(Qt.AlignCenter)
-        _sf = QFont(); _sf.setPointSize(10)
         self.lbl_status.setFont(_sf)
-        root.addWidget(self.lbl_status)
+        status_row.addWidget(self.lbl_status, stretch=1)
+        _sep = QLabel("|")
+        _sep.setAlignment(Qt.AlignCenter)
+        _sep.setFont(_sf)
+        _sep.setStyleSheet("color: #aaaaaa;")
+        status_row.addWidget(_sep)
+        self.lbl_magstim_status = QLabel("MAGIC: Not connected")
+        self.lbl_magstim_status.setAlignment(Qt.AlignCenter)
+        self.lbl_magstim_status.setFont(_sf)
+        self.lbl_magstim_status.setStyleSheet("color: #aaaaaa;")
+        status_row.addWidget(self.lbl_magstim_status, stretch=1)
+        root.addLayout(status_row)
 
         root.addLayout(self._make_btn_row())
         self._on_mode_changed()
@@ -1036,6 +1889,11 @@ class RealTimeViewer(QMainWindow):
         self._paralysis_combo = QComboBox()
         self._paralysis_combo.addItems(["NA", "LEFT", "RIGHT"])
         mode_row.addWidget(self._paralysis_combo)
+        mode_row.addSpacing(8)
+        btn_active = QPushButton("Active")
+        btn_active.setFixedWidth(70)
+        btn_active.clicked.connect(self._on_active_clicked)
+        mode_row.addWidget(btn_active)
 
         mode_row.addStretch()
         return mode_row
@@ -1047,16 +1905,25 @@ class RealTimeViewer(QMainWindow):
         analysis_row.setSpacing(12)
 
         self.radio_none = QRadioButton("None")
-        self.radio_mep  = QRadioButton("MEP")
+        self.radio_mep  = QRadioButton("rMT")
+        self.radio_sici = QRadioButton("SICI")
         self.radio_mep.setChecked(True)
         self.radio_none.setEnabled(False)
         self.radio_mep.setEnabled(False)
+        self.radio_sici.setEnabled(False)
         analysis_group = QButtonGroup(self)
         analysis_group.addButton(self.radio_none)
         analysis_group.addButton(self.radio_mep)
+        analysis_group.addButton(self.radio_sici)
         self.radio_mep.toggled.connect(self._on_analysis_mode_changed)
+        self.radio_sici.toggled.connect(self._on_analysis_mode_changed)
         analysis_row.addWidget(self.radio_none)
         analysis_row.addWidget(self.radio_mep)
+        analysis_row.addWidget(self.radio_sici)
+
+        self._lbl_sici_msg = QLabel("Please switch TMS machine to Independent Triggering Mode.")
+        self._lbl_sici_msg.setVisible(False)
+        analysis_row.addWidget(self._lbl_sici_msg)
         analysis_row.addStretch()
 
         self.stack_analysis = _MaxSizeStack()
@@ -1170,6 +2037,13 @@ class RealTimeViewer(QMainWindow):
 
         mso_row.addStretch(1)
 
+        reconnect_font = QFont(); reconnect_font.setPointSize(11)
+        self.btn_magstim_reconnect = QPushButton("↺")
+        self.btn_magstim_reconnect.setFont(reconnect_font)
+        self.btn_magstim_reconnect.setFixedWidth(28)
+        self.btn_magstim_reconnect.setToolTip("Connect Magstim and use MAGIC")
+        self.btn_magstim_reconnect.clicked.connect(self._on_magstim_btn_clicked)
+        mso_row.addWidget(self.btn_magstim_reconnect)
         self.btn_sm = QPushButton("SM"); self.btn_sm.setFont(mode_font)
         self.btn_sm.setFixedWidth(64)
         self.btn_sm.setStyleSheet("background-color: #1565C0; color: white;")
@@ -1182,7 +2056,7 @@ class RealTimeViewer(QMainWindow):
         dot_font = QFont(); dot_font.setPointSize(15)
         self.lbl_magstim_dot = QLabel("●"); self.lbl_magstim_dot.setFont(dot_font)
         self.lbl_magstim_dot.setStyleSheet("color: #aaaaaa;")
-        self.lbl_magstim_dot.setToolTip(MAGSTIM_PORT)
+        self.lbl_magstim_dot.setToolTip("Not connected")
         mso_row.addWidget(self.lbl_magstim_dot)
         status_font = QFont(); status_font.setPointSize(13); status_font.setBold(True)
         self.lbl_magstim_state = QLabel("—"); self.lbl_magstim_state.setFont(status_font)
@@ -1196,31 +2070,40 @@ class RealTimeViewer(QMainWindow):
 
         lbl_mso1 = QLabel("MSO1:"); lbl_mso1.setFont(mso_font)
         mso_row.addWidget(lbl_mso1)
-        self.lbl_mso_val = QLabel("—"); self.lbl_mso_val.setFont(mso_font)
-        self.lbl_mso_val.setMinimumWidth(45)
-        mso_row.addWidget(self.lbl_mso_val)
+        self.spin_mso1 = _WheelSpinBox()
+        self.spin_mso1.setRange(0, 100); self.spin_mso1.setValue(0)
+        self.spin_mso1.setFont(mso_font); self.spin_mso1.setFixedWidth(60)
+        self.spin_mso1.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.spin_mso1.setToolTip("↑ Master TMS")
+        mso_row.addWidget(self.spin_mso1)
         mso_row.addSpacing(16)
 
         self.lbl_mso2 = QLabel("MSO2:"); self.lbl_mso2.setFont(mso_font)
-        self.lbl_mso2.setEnabled(False)
+        self.lbl_mso2.setStyleSheet("color: transparent;")
         mso_row.addWidget(self.lbl_mso2)
-        self.lbl_mso2_val = QLabel("—"); self.lbl_mso2_val.setFont(mso_font)
-        self.lbl_mso2_val.setMinimumWidth(45)
-        self.lbl_mso2_val.setEnabled(False)
-        mso_row.addWidget(self.lbl_mso2_val)
+        self.spin_mso2 = _WheelSpinBox()
+        self.spin_mso2.setRange(0, 100); self.spin_mso2.setValue(0)
+        self.spin_mso2.setFont(mso_font); self.spin_mso2.setFixedWidth(60)
+        self.spin_mso2.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.spin_mso2.setToolTip("↓ Slave TMS")
+        self.spin_mso2.setStyleSheet("color: transparent; background: transparent; border: transparent;")
+        mso_row.addWidget(self.spin_mso2)
 
         isi_font = QFont(); isi_font.setPointSize(13)
         self.lbl_ipi = QLabel("  ISI:"); self.lbl_ipi.setFont(isi_font)
-        self.lbl_ipi.setEnabled(False)
+        self.lbl_ipi.setStyleSheet("color: transparent;")
         mso_row.addWidget(self.lbl_ipi)
-        self.lbl_isi_val = QLabel("—"); self.lbl_isi_val.setFont(isi_font)
-        self.lbl_isi_val.setEnabled(False)
-        self.lbl_isi_val.setMinimumWidth(80)
-        mso_row.addWidget(self.lbl_isi_val)
+        self.spin_isi = QDoubleSpinBox()
+        self.spin_isi.setRange(0.0, 999.9); self.spin_isi.setValue(0.0)
+        self.spin_isi.setDecimals(1); self.spin_isi.setSuffix(" ms")
+        self.spin_isi.setFont(isi_font); self.spin_isi.setFixedWidth(90)
+        self.spin_isi.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.spin_isi.setStyleSheet("color: transparent; background: transparent; border: transparent;")
+        mso_row.addWidget(self.spin_isi)
         mso_row.addSpacing(16)
 
-        lbl_loc = QLabel("Loc ID:"); lbl_loc.setFont(mso_font)
-        mso_row.addWidget(lbl_loc)
+        self._lbl_loc = QLabel("Loc ID:"); self._lbl_loc.setFont(mso_font)
+        mso_row.addWidget(self._lbl_loc)
         self.spin_location = _WheelSpinBox()
         self.spin_location.setRange(1, 9999); self.spin_location.setValue(1)
         self.spin_location.setFixedWidth(100); self.spin_location.setFont(mso_font)
@@ -1228,12 +2111,9 @@ class RealTimeViewer(QMainWindow):
         mso_row.addWidget(self.spin_location)
 
         mso_row.addStretch(1)
-        btn_new_best = QPushButton("New Best"); btn_new_best.setFont(btn_font)
-        btn_new_best.clicked.connect(self._on_new_best)
-        mso_row.addWidget(btn_new_best)
-        btn_equal_best = QPushButton("Equal Best"); btn_equal_best.setFont(btn_font)
-        btn_equal_best.clicked.connect(self._on_equal_best)
-        mso_row.addWidget(btn_equal_best)
+        self._btn_new_best = QPushButton("New Best"); self._btn_new_best.setFont(btn_font)
+        self._btn_new_best.clicked.connect(self._on_new_best)
+        mso_row.addWidget(self._btn_new_best)
         self.combo_best = QComboBox(); self.combo_best.setFont(btn_font)
         self.combo_best.setMinimumWidth(180)
         mso_row.addWidget(self.combo_best)
@@ -1245,14 +2125,59 @@ class RealTimeViewer(QMainWindow):
         scope_vbox.setContentsMargins(0, 0, 0, 0)
         scope_vbox.setSpacing(8)
 
-        hunt_row = QHBoxLayout()
+        self._hunt_row_widget = QWidget()
+        hunt_row = QHBoxLayout(self._hunt_row_widget)
+        hunt_row.setContentsMargins(0, 0, 0, 0)
         hunt_row.setSpacing(8)
         hunt_row.addSpacing(81)
         hunt_row.addLayout(self._make_hunt_panel("left"))
         hunt_row.addSpacing(135)
         hunt_row.addLayout(self._make_hunt_panel("right"))
         hunt_row.addSpacing(81)
-        scope_vbox.addLayout(hunt_row)
+        # SICI row (shown instead of hunt row in SICI mode)
+        self._sici_row_widget = QWidget()
+        self._sici_row_widget.setVisible(False)
+        sici_row = QHBoxLayout(self._sici_row_widget)
+        sici_row.setContentsMargins(0, 0, 0, 0)
+        sici_row.setSpacing(10)
+
+        sici_font = QFont(); sici_font.setPointSize(12)
+
+        btn_single = QPushButton("Single Pulse")
+        btn_single.setFont(sici_font)
+        btn_single.clicked.connect(self._on_single_pulse_clicked)
+        btn_double = QPushButton("Double Pulse")
+        btn_double.setFont(sici_font)
+        btn_double.clicked.connect(self._on_double_pulse_clicked)
+
+        self._sici_isi_spin = QDoubleSpinBox()
+        self._sici_isi_spin.setRange(0.1, 999.9)
+        self._sici_isi_spin.setValue(2.5)
+        self._sici_isi_spin.setSingleStep(0.1)
+        self._sici_isi_spin.setDecimals(1)
+        self._sici_isi_spin.setSuffix("")
+        self._sici_isi_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self._sici_isi_spin.setFixedWidth(80)
+        self._sici_isi_spin.setFont(sici_font)
+
+        sici_row.addSpacing(81)
+        sici_row.addWidget(btn_single)
+        sici_row.addWidget(btn_double)
+        sici_row.addSpacing(12)
+        lbl_isi_sici = QLabel("ISI (ms):")
+        lbl_isi_sici.setFont(sici_font)
+        sici_row.addWidget(lbl_isi_sici)
+        sici_row.addWidget(self._sici_isi_spin)
+        sici_row.addStretch()
+
+        # Stack hunt and sici rows in the same vertical space
+        row_stack = QWidget()
+        row_stack_layout = QVBoxLayout(row_stack)
+        row_stack_layout.setContentsMargins(0, 0, 0, 0)
+        row_stack_layout.setSpacing(0)
+        row_stack_layout.addWidget(self._hunt_row_widget)
+        row_stack_layout.addWidget(self._sici_row_widget)
+        scope_vbox.addWidget(row_stack)
 
         sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setFrameShadow(QFrame.Sunken)
         scope_vbox.addWidget(sep)
@@ -1326,7 +2251,7 @@ class RealTimeViewer(QMainWindow):
         mep_end   = QSpinBox();  mep_end.setRange(1, 500);     mep_end.setValue(50);    mep_end.setSuffix(" ms");   mep_end.setButtonSymbols(QAbstractSpinBox.NoButtons)
         threshold = QDoubleSpinBox(); threshold.setRange(0.01, 100); threshold.setSingleStep(0.01)
         threshold.setDecimals(2); threshold.setValue(0.05); threshold.setSuffix(" mV"); threshold.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        prestim_start = QSpinBox(); prestim_start.setRange(-1000, -1); prestim_start.setValue(-200); prestim_start.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        prestim_start = QSpinBox(); prestim_start.setRange(-1000, -1); prestim_start.setValue(-150); prestim_start.setButtonSymbols(QAbstractSpinBox.NoButtons)
         prestim_end   = QSpinBox(); prestim_end.setRange(-500, -1);   prestim_end.setValue(-50); prestim_end.setSuffix(" ms"); prestim_end.setButtonSymbols(QAbstractSpinBox.NoButtons)
 
         mp.addWidget(QLabel("MEP window"))
@@ -1419,6 +2344,14 @@ class RealTimeViewer(QMainWindow):
         self._plot_window.show()
         self._plot_window.raise_()
         self._plot_window.activateWindow()
+
+    def _on_active_clicked(self):
+        if self._active_window is None or not self._active_window.isVisible():
+            self._active_window = ActiveWindow(self)
+        self._active_window.populate_ch_combos()
+        self._active_window.show()
+        self._active_window.raise_()
+        self._active_window.activateWindow()
 
     def _sync_plot_table(self):
         if self._plot_window is not None and self._plot_window.isVisible():
@@ -1658,6 +2591,7 @@ class RealTimeViewer(QMainWindow):
 
         self.radio_none.setEnabled(not chart)
         self.radio_mep.setEnabled(not chart)
+        self.radio_sici.setEnabled(not chart)
         mep_active = (not chart) and self.radio_mep.isChecked()
         for s in (self.L, self.R):
             s.hunt_panel.setEnabled(mep_active)
@@ -1677,10 +2611,34 @@ class RealTimeViewer(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_analysis_mode_changed(self):
-        mep = self.radio_mep.isChecked()
-        self.widget_mep_params.setEnabled(mep)
+        is_rmt  = self.radio_mep.isChecked()
+        is_sici = self.radio_sici.isChecked()
+        is_any  = is_rmt or is_sici
+
+        self._lbl_sici_msg.setVisible(is_sici)
+        self.widget_mep_params.setEnabled(is_any)
+
+        # Hunt row: visible only for rMT; SICI row: visible only for SICI
+        self._hunt_row_widget.setVisible(is_rmt)
+        self._sici_row_widget.setVisible(is_sici)
         for s in (self.L, self.R):
-            s.hunt_panel.setEnabled(mep)
+            s.hunt_panel.setEnabled(is_rmt)
+
+        # SICI constraints
+        self.btn_sm.setEnabled(not is_sici)
+        _isi_style = "color: transparent;" if is_sici else ""
+        self.lbl_ipi.setStyleSheet(_isi_style)
+        self.spin_isi.setStyleSheet(_isi_style)
+        sici_location_enabled = not is_sici
+        self._lbl_loc.setEnabled(sici_location_enabled)
+        self.spin_location.setEnabled(sici_location_enabled)
+        self._btn_new_best.setEnabled(sici_location_enabled)
+        self.combo_best.setEnabled(sici_location_enabled)
+
+        if is_sici:
+            # Force DM mode
+            self._on_dm_clicked()
+
         if self.radio_scope.isChecked():
             self._update_scope([self.L.ch, self.R.ch])
 
@@ -1734,49 +2692,265 @@ class RealTimeViewer(QMainWindow):
                 self._update_hunt_display("left" if s is self.L else "right")
 
     def _on_new_best(self):
-        label = f"{self._mso1_val}%at{self.spin_location.value()}"
-        self.combo_best.addItem(label)
-        idx = self.combo_best.count() - 1
-        self.combo_best.setItemData(idx, QColor("red"), Qt.ForegroundRole)
-        self.combo_best.setCurrentIndex(idx)
+        mso1 = self.spin_mso1.value()
+        loc  = self.spin_location.value()
+        if self._magstim_mode == "DM":
+            mso2 = self.spin_mso2.value()
+            isi  = self.spin_isi.value()
+            label = f"{mso1}_{mso2}_{isi:.1f}_{loc}"
+        else:
+            label = f"{mso1}_{loc}"
 
-    def _on_equal_best(self):
-        label = f"{self._mso1_val}%at{self.spin_location.value()}"
-        self.combo_best.addItem(label)
-        idx = self.combo_best.count() - 1
-        self.combo_best.setItemData(idx, QColor("#e65100"), Qt.ForegroundRole)
-        self.combo_best.setCurrentIndex(idx)
+        # collect existing items, add new one, sort by MSO1 (first number before _)
+        items = [self.combo_best.itemText(i) for i in range(self.combo_best.count())]
+        items.append(label)
+
+        def _mso1_key(s):
+            try:
+                return int(s.split("_")[0])
+            except ValueError:
+                return 0
+
+        items.sort(key=_mso1_key)
+        self.combo_best.clear()
+        for item in items:
+            self.combo_best.addItem(item)
+        self.combo_best.setCurrentText(label)
 
     def _on_sm_clicked(self):
         self._magstim_mode = "SM"
         self.btn_sm.setStyleSheet("background-color: #1565C0; color: white;")
         self.btn_dm.setStyleSheet("")
-        self.lbl_mso2.setEnabled(False)
-        self.lbl_mso2_val.setEnabled(False)
-        self.lbl_mso2_val.setText("—")
-        self.lbl_ipi.setEnabled(False)
-        self.lbl_isi_val.setEnabled(False)
-        self.lbl_isi_val.setText("—")
+        self.lbl_mso2.setStyleSheet("color: transparent;")
+        self.spin_mso2.setStyleSheet("color: transparent; background: transparent; border: transparent;")
+        self.lbl_ipi.setStyleSheet("color: transparent;")
+        self.spin_isi.setStyleSheet("color: transparent; background: transparent; border: transparent;")
+        self.combo_best.clear()
 
     def _on_dm_clicked(self):
         self._magstim_mode = "DM"
         self.btn_dm.setStyleSheet("background-color: #1565C0; color: white;")
         self.btn_sm.setStyleSheet("")
-        self.lbl_mso2.setEnabled(True)
-        self.lbl_mso2_val.setEnabled(True)
-        self.lbl_ipi.setEnabled(True)
-        self.lbl_isi_val.setEnabled(True)
+        self.lbl_mso2.setStyleSheet("")
+        self.spin_mso2.setStyleSheet("")
+        self.combo_best.clear()
+        self.lbl_ipi.setStyleSheet("")
+        self.spin_isi.setStyleSheet("")
 
-    def _connect_magstim(self):
+    # ------------------------------------------------------------------
+    # FRO helpers (SICI Single/Double Pulse)
+    # ------------------------------------------------------------------
+
+    def _load_vbs_hex(self, rel_path):
+        """Extract PlayMessage hex string from a .vbs file."""
+        import re
+        base = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base, rel_path)
+        try:
+            with open(path, "r") as f:
+                content = f.read()
+        except OSError:
+            return None
+        m = re.search(r'PlayMessage\s*\("(0x[0-9A-Fa-f]+)"\)', content)
+        return m.group(1) if m else None
+
+    _FRO_TWO_STEP = False  # True: template → 50ms → modified; False: modified only
+
+    def _set_fro_output_delay(self, hex_str, output_num, delay_s):
+        """Replace the PulseDelay of a specific output and fix checksum (bytes 20-23)."""
+        raw = bytearray(bytes.fromhex(hex_str[2:]))
+        orig_sum      = sum(raw)
+        output_marker = f"Output = {output_num}\n".encode("utf-16-le")
+        key           = "PulseDelay = ".encode("utf-16-le")
+        newline_le    = b"\x0a\x00"
+
+        pos = raw.find(bytes(output_marker))
+        if pos == -1:
+            return hex_str
+        pd_pos = raw.find(bytes(key), pos)
+        if pd_pos == -1:
+            return hex_str
+
+        val_start = pd_pos + len(key)
+        val_end   = raw.find(newline_le, val_start)
+        if val_end == -1:
+            return hex_str
+
+        old_len = val_end - val_start
+        new_val = f"{delay_s:.4f}".encode("utf-16-le")
+        new_len = len(new_val)
+
+        if new_len < old_len:
+            new_val = new_val + b"\x20\x00" * ((old_len - new_len) // 2)
+        elif new_len > old_len:
+            new_val = new_val[:old_len]
+
+        raw[val_start:val_end] = new_val
+
+        # fix checksum at bytes 20-23 (sum of all bytes, uint32 little-endian)
+        delta    = sum(raw) - orig_sum
+        old_csum = int.from_bytes(raw[20:24], "little")
+        new_csum = (old_csum + delta) % 0x100000000
+        raw[20:24] = new_csum.to_bytes(4, "little")
+
+        return "0x" + raw.hex().upper()
+
+    # ------------------------------------------------------------------
+    # TriggerBox helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_triggerbox(self):
+        if not _SERIAL_AVAILABLE:
+            return False
+        tb = getattr(self, "_triggerbox_port", None)
+        if tb and tb.is_open:
+            return True
+        try:
+            self._triggerbox_port = serial.Serial(
+                TRIGGERBOX_PORT, TRIGGERBOX_BAUD, timeout=0.1
+            )
+            self._triggerbox_port.write(bytes([0]))  # reset on open
+            self._triggerbox_port.flush()
+            return True
+        except Exception:
+            self._triggerbox_port = None
+            return False
+
+    def _fire_triggerbox(self):
+        if not self._ensure_triggerbox():
+            return
+        channel_byte = 1 << (TRIGGERBOX_CHANNEL - 1)
+        try:
+            self._triggerbox_port.write(bytes([channel_byte]))
+            self._triggerbox_port.flush()
+            QTimer.singleShot(TRIGGERBOX_PULSE_MS, self._reset_triggerbox)
+        except Exception:
+            pass
+
+    def _reset_triggerbox(self):
+        tb = getattr(self, "_triggerbox_port", None)
+        if tb and tb.is_open:
+            try:
+                tb.write(bytes([0]))
+                tb.flush()
+            except Exception:
+                pass
+
+    def _on_single_pulse_clicked(self):
+        if self.client is None:
+            return
+        sp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "SinglePulse.vbs"))
+        if not sp_hex:
+            return
+        if self._FRO_TWO_STEP:
+            self.client.play_message(sp_hex)
+            time.sleep(0.05)
+        self.client.play_message(sp_hex)
+        time.sleep(0.05)
+        self._fire_triggerbox()
+
+    def _on_double_pulse_clicked(self):
+        if self.client is None:
+            return
+        dp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "DoublePulse.vbs"))
+        if not dp_hex:
+            return
+        # Keep Output 1 at template delay (0.0501s); only modify Output 2 = 0.0501 + ISI
+        isi_s    = self._sici_isi_spin.value() / 1000.0
+        out2_s   = 0.0501 + isi_s
+        modified = self._set_fro_output_delay(dp_hex, 2, out2_s)
+        if self._FRO_TWO_STEP:
+            self.client.play_message(dp_hex)   # template restore
+            time.sleep(0.05)
+        self.client.play_message(modified)
+        time.sleep(0.05)
+        self._fire_triggerbox()
+
+    def _refresh_com_ports(self):
+        pass  # combo removed; port stored in _magstim_selected_port
+
+    def _auto_find_magstim_port(self):
+        """Scan all COM ports and return the first one that responds to Magstim Q@ command."""
+        if not _SERIAL_AVAILABLE:
+            return None
+        ports = sorted(p.device for p in serial.tools.list_ports.comports())
+        for port_name in ports:
+            try:
+                with serial.Serial(port_name, 9600, bytesize=serial.EIGHTBITS,
+                                   parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
+                                   timeout=0.2) as test_port:
+                    if enable_remote(test_port):
+                        disable_remote(test_port)
+                        return port_name
+            except Exception:
+                continue
+        return None
+
+    def _on_magstim_btn_clicked(self):
+        if self._magstim_port is not None and self._magstim_port.is_open:
+            self._disconnect_magstim()
+        else:
+            self._connect_magstim_auto()
+
+    def _disconnect_magstim(self):
+        self._magstim_stop.set()
+        if self._magstim_port is not None:
+            try:
+                self._magstim_port.close()
+            except Exception:
+                pass
+            self._magstim_port = None
+        self._magstim_last_poll_t = 0.0
+        self._magstim_stop = threading.Event()
+        self.lbl_magstim_dot.setStyleSheet("color: #aaaaaa;")
+        self.lbl_magstim_dot.setToolTip("Not connected")
+        self.lbl_magstim_state.setText("—")
+        self.lbl_magstim_state.setStyleSheet("color: #aaaaaa;")
+        self.lbl_magstim_status.setText("MAGIC: Not connected")
+        self.lbl_magstim_status.setStyleSheet("color: #aaaaaa;")
+        self.btn_magstim_reconnect.setText("↺")
+        self.btn_magstim_reconnect.setToolTip("Connect Magstim and use MAGIC")
+        self.spin_mso1.setReadOnly(False)
+        self.spin_mso2.setReadOnly(False)
+        self.spin_isi.setReadOnly(False)
+
+    def _connect_magstim_auto(self):
+        from PyQt5.QtWidgets import QMessageBox, QApplication
+        self._magstim_stop.set()
+        if self._magstim_port is not None:
+            try:
+                self._magstim_port.close()
+            except Exception:
+                pass
+            self._magstim_port = None
+        self._magstim_last_poll_t = 0.0
+        self._magstim_stop = threading.Event()
+        self.lbl_magstim_status.setText("⟳  Scanning COM ports for Magstim device...")
+        self.lbl_magstim_status.setStyleSheet("color: #1565C0;")
+        QApplication.processEvents()
+        found = self._auto_find_magstim_port()
+        if found:
+            self._magstim_selected_port = found
+            self._connect_magstim()
+            QMessageBox.information(self, "Magstim", f"Magstim detected on {found}.")
+        else:
+            self.lbl_magstim_status.setText("MAGIC: Not connected")
+            self.lbl_magstim_status.setStyleSheet("color: #aaaaaa;")
+            QMessageBox.warning(self, "Magstim", "Magstim not detected.\nPlease check that the device is connected.")
+
+    def _connect_magstim(self, port=None):
         if not _SERIAL_AVAILABLE:
             return
+        selected_port = port or getattr(self, "_magstim_selected_port", MAGSTIM_PORT)
+        if not selected_port:
+            return
         try:
-            port = serial.Serial(
-                port=MAGSTIM_PORT, baudrate=9600,
+            ser = serial.Serial(
+                port=selected_port, baudrate=9600,
                 bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE, timeout=0.3,
             )
-            self._magstim_port = port
+            self._magstim_port = ser
             self._magstim_stop.clear()
             t = threading.Thread(target=self._magstim_thread_func, daemon=True)
             t.start()
@@ -1806,14 +2980,19 @@ class RealTimeViewer(QMainWindow):
         f = params["flags"]
         state = "RDY" if f["ready"] else "ARM" if f["armed"] else "SBY"
 
+        port = getattr(self, "_magstim_selected_port", MAGSTIM_PORT)
         self.lbl_magstim_dot.setStyleSheet("color: #2e7d32;")
-        self.lbl_magstim_dot.setToolTip(MAGSTIM_PORT)
+        self.lbl_magstim_dot.setToolTip(port)
         self.lbl_magstim_state.setText(state)
         self.lbl_magstim_state.setStyleSheet(
             "color: #2e7d32;" if f["ready"] else
             "color: #e65100;" if f["armed"] else
             "color: #555555;"
         )
+        self.lbl_magstim_status.setText(f"MAGIC: Connected - {port}")
+        self.lbl_magstim_status.setStyleSheet("color: #2e7d32;")
+        self.btn_magstim_reconnect.setText("✕")
+        self.btn_magstim_reconnect.setToolTip("Disconnect MAGIC and control manually")
 
         if temp is not None:
             t1 = temp["temp1"] / 10.0
@@ -1825,16 +3004,16 @@ class RealTimeViewer(QMainWindow):
                 f"Coil1: {t1:.1f}°C    Coil2: {t2:.1f}°C"
             )
 
-        self._mso1_val = params["power_a"]
-        self.lbl_mso_val.setText(str(params["power_a"]))
+        self.spin_mso1.setValue(params["power_a"])
+        self.spin_mso1.setReadOnly(True)
         if self._magstim_mode == "DM":
-            self._mso2_val = params["power_b"]
-            self._isi_val  = f"{params['ipi'] / 10.0:.1f}"
-            self.lbl_mso2_val.setText(str(params["power_b"]))
-            self.lbl_isi_val.setText(f"{params['ipi'] / 10.0:.1f} ms")
+            self.spin_mso2.setValue(params["power_b"])
+            self.spin_isi.setValue(params["ipi"] / 10.0)
+            self.spin_mso2.setReadOnly(True)
+            self.spin_isi.setReadOnly(True)
         else:
-            self._mso2_val = 0
-            self._isi_val  = "—"
+            self.spin_mso2.setReadOnly(True)
+            self.spin_isi.setReadOnly(True)
 
     def closeEvent(self, event):
         if self.is_running:
@@ -1842,11 +3021,17 @@ class RealTimeViewer(QMainWindow):
         self._magstim_stop.set()
         if self._magstim_port is not None:
             try:
+                disable_remote(self._magstim_port)
+            except Exception:
+                pass
+            try:
                 self._magstim_port.close()
             except Exception:
                 pass
         if self._plot_window is not None:
             self._plot_window.close()
+        if self._active_window is not None:
+            self._active_window.close()
         super().closeEvent(event)
 
     def _on_separate_toggled(self, checked):
@@ -2008,10 +3193,18 @@ class RealTimeViewer(QMainWindow):
         # Magstim connection timeout: grey out if no poll for >3 seconds
         if self._magstim_last_poll_t > 0 and time.time() - self._magstim_last_poll_t > 3.0:
             self.lbl_magstim_dot.setStyleSheet("color: #aaaaaa;")
+            self.lbl_magstim_dot.setToolTip("Not connected")
             self.lbl_magstim_state.setText("—")
             self.lbl_magstim_state.setStyleSheet("color: #aaaaaa;")
             self.lbl_magstim_temp.setText("—")
             self.lbl_magstim_temp.setToolTip("Coil temp unavailable")
+            self.lbl_magstim_status.setText("MAGIC: Not connected")
+            self.lbl_magstim_status.setStyleSheet("color: #aaaaaa;")
+            self.btn_magstim_reconnect.setText("↺")
+            self.btn_magstim_reconnect.setToolTip("Connect Magstim and use MAGIC")
+            self.spin_mso1.setReadOnly(False)
+            self.spin_mso2.setReadOnly(False)
+            self.spin_isi.setReadOnly(False)
 
     def _populate_combos(self):
         new_info = self.client.get_channel_info()
@@ -2116,15 +3309,15 @@ class RealTimeViewer(QMainWindow):
             s.hunt_latest_eval  = False
             s.table_latest_eval = False
         loc_id   = self.spin_location.value()
-        mso2_str = str(self._mso2_val) if self._magstim_mode == "DM" else "0"
-        isi_str  = self._isi_val if self._magstim_mode == "DM" else "0"
+        mso2_str = str(self.spin_mso2.value()) if self._magstim_mode == "DM" else "0"
+        isi_str  = f"{self.spin_isi.value():.1f}" if self._magstim_mode == "DM" else "0"
         row_vals = [
             lambda s: str(trial_num),
             lambda s: str(s.ch + 1),
             lambda s: self._get_hand(s),
             lambda s: self._get_paralysis(s),
             lambda s: str(loc_id),
-            lambda s: str(self._mso1_val),
+            lambda s: str(self.spin_mso1.value()),
             lambda s: mso2_str,
             lambda s: isi_str,
             lambda s: "0",          # MEP_amp  (col 8)
@@ -2151,13 +3344,18 @@ class RealTimeViewer(QMainWindow):
         self._sync_plot_table()
 
     def _open_labchart(self):
-        search_dir = Path(__file__).parent
-        candidates = list(search_dir.glob(f"{Path(LABCHART_FILE).stem}*.adicht"))
-        if not candidates:
-            self.lbl_status.setText(f"✕  {LABCHART_FILE} not found in TMSviewer folder")
-            self.lbl_status.setStyleSheet("color: #b71c1c;")
+        import sys
+        search_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+        adiset = sorted(search_dir.glob("*.adiset"))
+        if adiset:
+            os.startfile(str(adiset[0]))
             return
-        os.startfile(str(candidates[0]))
+        adicht = sorted(search_dir.glob("*.adicht"))
+        if adicht:
+            os.startfile(str(adicht[0]))
+            return
+        self.lbl_status.setText("✕  No .adiset or .adicht file found in app folder")
+        self.lbl_status.setStyleSheet("color: #b71c1c;")
 
     # ------------------------------------------------------------------
     # Real-time update
@@ -2320,7 +3518,7 @@ class RealTimeViewer(QMainWindow):
                 ):
                     region = pg.LinearRegionItem(
                         values=(a, b),
-                        brush=pg.mkBrush(255, 220, 0, 60),
+                        brush=pg.mkBrush(160, 160, 160, 60),
                         pen=pg.mkPen(None),
                         movable=False,
                     )
