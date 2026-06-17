@@ -1,0 +1,196 @@
+Yes. Here is the transplant-friendly workflow for the FRO automation we used in Precise_Game_VP.py, with the code pieces in the order they run.
+
+Overview
+The automation has 3 layers:
+
+Read saved LabChart macro messages from .vbs files
+Decide before sampling whether FRO should be ON or OFF for the selected session
+During each stim trial, restore the known-good FRO baseline and then set that trial’s delay
+You can transplant those 3 layers into another task without needing the rest of the game logic.
+
+Files Used
+These paths are defined near the top of the file:
+
+Precise_Game_VP.py (line 56)
+External macros:
+First.vbs
+OffOn.vbs
+First.vbs is the “known-good FRO baseline” template.
+OffOn.vbs is the recorded manual off->on transition.
+
+Step 1: COM bridge into LabChart
+These functions are the base connection layer:
+
+_labchart_call_method(...) (line 329)
+What it does:
+
+Attaches to the active LabChart document
+Calls LabChart COM methods like PlayMessage(...) and GetConfigTabText(...)
+This is the core function that actually sends commands into LabChart.
+
+Step 2: Load macro messages from disk
+These parse the .vbs files and extract the hex PlayMessage(...) payloads:
+
+_load_fro_template_message() (line 353)
+_load_fro_playmessages(...) (line 366)
+_get_fro_template_playmessage() (line 373)
+What they do:
+
+First.vbs -> load one baseline FRO message
+OffOn.vbs -> load both messages from the manual off->on sequence
+Step 3: Optional FRO state check
+These inspect LabChart config text to see whether outputs already appear on:
+
+_labchart_get_fro_config_text() (line 376)
+_fro_outputs_enabled_from_text(...) (line 390)
+What they do:
+
+Ask LabChart for the Fast Response Output config text
+Try to infer whether Output 1 and Output 2 are currently on
+This is just the pre-check layer, not the actual per-trial configuration.
+
+Step 4: Build a per-trial delayed FRO message
+This is the delay-editing logic:
+
+_build_fro_playmessage(delay_s, enabled=True) (line 413)
+What it does:
+
+Starts from the First.vbs baseline message
+Rewrites only PulseDelay = 0.025 to the requested trial delay
+Preserves message length
+Updates the internal checksum-like field
+This is the function that lets trial delays vary automatically.
+
+Step 5: Arm FRO for each stim trial
+This is the most important in-trial function:
+
+labchart_prepare_internal_stim(delay_ms) (line 453)
+Workflow inside it:
+
+Replay the exact template from First.vbs
+That restores the known-good baseline where:
+Output 1 is immediate
+Output 2 is the delayed channel
+If this trial’s delay is not the template delay:
+build a modified message with _build_fro_playmessage(...)
+send that into LabChart
+Return True if FRO is ready
+This is the piece you call once before each stim trial.
+
+Step 6: Turn FRO on before stim sessions
+This is the pre-session “make sure FRO is on” logic:
+
+labchart_prime_fro(force_check=False) (line 478)
+Workflow inside it:
+
+If state is already known and on, return
+Otherwise ask LabChart whether outputs already look on
+If already on, mark that state and do nothing else
+If not on:
+replay both messages from OffOn.vbs
+then replay the First.vbs template again
+this is important because OffOn.vbs restores power/state, but the template restores the correct baseline where Output 1 is immediate
+This is the part that made cold-start recovery work.
+
+Step 7: Turn FRO off before non-stim sessions
+This is the pre-session “make sure FRO is off” logic:
+
+close_labchart_stim(force=False) (line 568)
+Workflow inside it:
+
+If already known off and not forced, return
+If OffOn.vbs exists:
+use its first message as the OFF action
+Otherwise:
+generate an OFF message from the template using _build_fro_playmessage(..., enabled=False)
+Mark cached state as off
+This is what keeps practice mode quiet.
+
+Step 8: Choose ON or OFF before sampling
+This is the session-level controller:
+
+labchart_prepare_fro_for_choice(choice_name) (line 602)
+Workflow:
+
+If selected session is stim_session and stimulation is enabled:
+call labchart_prime_fro(force_check=True)
+Otherwise:
+call close_labchart_stim(force=True)
+This is the main “mode router”.
+
+Step 9: Run the mode check before sampling
+This is where the workflow is actually used:
+
+startup:
+Precise_Game_VP.py (line 2623)
+after returning to the menu:
+Precise_Game_VP.py (line 2697)
+Actual order:
+
+choice = show_task_menu(...)
+labchart_prepare_fro_for_choice(choice)
+labchart_start_sampling()
+settle_labchart(...)
+That ordering matters. The FRO ON/OFF decision happens before sampling starts.
+
+Step 10: Arm per-trial delay inside the stim block
+Inside the stim session loop:
+
+Precise_Game_VP.py (line 1510)
+Workflow:
+
+For each stim trial, get the planned stim_delay_ms
+Call labchart_prepare_internal_stim(trial_plan["stim_delay_ms"])
+Then run the normal GO cue / TTL / task trial
+That gives you:
+
+Output 1 immediate
+Output 2 delayed for that trial
+Minimal transplant recipe
+If you want to move this into another task, you mainly need:
+
+Constants / file paths
+FRO_TEMPLATE_VBS_PATH
+FRO_OFF_ON_VBS_PATH
+FRO_TEMPLATE_DELAY_S
+COM helpers
+_labchart_stim_attach()
+_labchart_call_method(...)
+Macro/message loaders
+_load_fro_template_message()
+_load_fro_playmessages(...)
+_get_fro_template_playmessage()
+Delay editor
+_replace_bytes_same_len(...)
+_build_fro_playmessage(...)
+Session-level state control
+labchart_prime_fro(...)
+close_labchart_stim(...)
+labchart_prepare_fro_for_choice(...)
+Trial-level arming
+labchart_prepare_internal_stim(delay_ms)
+Call order in the new task
+Before sampling:
+labchart_prepare_fro_for_choice(choice)
+Before each stim trial:
+labchart_prepare_internal_stim(delay_ms)
+Practical transplant pattern
+For another task, the skeleton is basically:
+
+choice = get_task_choice()
+
+if INPUT_MODE == "labchart":
+    init_labchart()
+    labchart_prepare_fro_for_choice(choice)
+    labchart_start_sampling()
+    settle_labchart(3.0)
+
+if choice == "stim_session":
+    for trial in stim_trials:
+        labchart_prepare_internal_stim(trial["stim_delay_ms"])
+        run_trial()
+else:
+    run_nonstim_task()
+If you want, I can turn just this FRO automation into a separate reusable block like fro_labchart_utils.py so you can import it into another task instead of copying pieces by hand.
+
+The vbs code First Second and Thrid, OffOn, are all in the folder: G:\Shared drives\Cunningham Lab\Studies\LabChart Settings Files\Supplimantary Folder. Check the same google drive folder to see if they exist. Sometimes Google drive starting letter can be different, like H or I. Run it after confirmation.

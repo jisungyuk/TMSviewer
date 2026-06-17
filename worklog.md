@@ -2,6 +2,42 @@
 
 ---
 
+## 2026-06-16
+
+### LabChart FRO + TriggerBox 연결 테스트 (test_fro_pulse.py)
+
+#### 셋업
+- TMS: Magstim BiStim (Independent triggering mode)
+  - PowerLab Output 1 → Conditioning machine 트리거
+  - PowerLab Output 2 → Testing machine 트리거
+  - Conditioning machine feedback → ch6
+- TriggerBox: Brain Products (COM5, 115200 baud), ch1 → PowerLab Input 5 (analog)
+- FRO 트리거 조건: Input 5 above 3.5V (hex 내부: `Input = 4`, `Level = 35`, 0-indexed)
+
+#### 검증 완료
+- Python → `win32com.GetActiveObject("ADIChart.Application")` → `PlayMessage(hex)` → FRO 설정
+- `pyserial` COM5 → TriggerBox `0x01` → PowerLab Input 5 → FRO 발화
+- DoublePulse / SinglePulse 템플릿 발화 확인
+- ISI 동적 변경 (`set_fro_output_delay`) 확인
+
+#### 주요 발견 및 수정
+
+**COM 연결**
+- `CreateObject("ADIChart.Document")` → 새 문서 생성 (잘못된 방식) → `.vbs` 파일을 `GetObject` 방식으로 수정
+- COM 객체 캐시 시 `RPC_E_DISCONNECTED (-2147417848)` 발생 → `play_message()` 내부에서 매번 fresh 연결하도록 수정
+
+**FRO hex 구조**
+- PlayMessage hex = 바이너리 헤더 + UTF-16LE 인코딩 FRO 설정 텍스트
+- ISI 변경: `PulseDelay` 값 바이트 in-place 치환 (6자 `X.XXXX` 고정 길이)
+- byte 20–23: 체크섬, 치환 후 byte sum delta만큼 업데이트
+
+**트러블슈팅**
+- SinglePulse 발화 안 됨 + ch6 신호 없음 → ch6 = Conditioning 피드백만 수신 (Testing 피드백 미연결), 별개로 Output 2 케이블 불량
+- DoublePulse에서 클릭 한 번만 들림 → Output 2 케이블 불량 (Conditioning만 발화 중이었음)
+- **근본 원인: MAGIC 셋업 케이블이 Output 2 → Testing machine 연결을 방해** → MAGIC 제거 후 정상 동작 확인
+
+---
+
 ## 2026-06-15
 
 ### ActiveWindow — MVC / Hold Task popup (realtime_viewer.py)

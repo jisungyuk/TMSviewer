@@ -57,7 +57,8 @@ class LabChartClient:
 
     def play_message(self, hex_str: str):
         """Send an FRO configuration to LabChart via PlayMessage."""
-        self.doc.PlayMessage(hex_str)
+        app = win32com.client.GetActiveObject("ADIChart.Application")
+        app.ActiveDocument.PlayMessage(hex_str)
 
     def start_sampling(self):
         self.doc.StartSampling(0, False, 0)

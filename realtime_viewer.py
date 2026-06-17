@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QLabel, QSpinBox, QApplication,
     QRadioButton, QButtonGroup, QDoubleSpinBox, QCheckBox, QAbstractSpinBox, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView, QGraphicsOpacityEffect, QStackedWidget,
-    QTabBar, QToolTip, QLineEdit, QShortcut,
+    QTabBar, QToolTip, QLineEdit, QShortcut, QDialog, QTextBrowser,
 )
 from PyQt5.QtGui import QFont, QColor, QCursor, QKeySequence
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal
@@ -1699,9 +1699,15 @@ class PlotWindow(QWidget):
         self.refresh()
 
     def closeEvent(self, event):
-        if hasattr(self, "_calc_window") and self._calc_window is not None:
-            self._calc_window.close()
-        super().closeEvent(event)
+        if getattr(self, "_force_close", False):
+            if hasattr(self, "_calc_window") and self._calc_window is not None:
+                self._calc_window.close()
+            super().closeEvent(event)
+        else:
+            if self._streaming:
+                self._on_mvc_clicked()
+            event.ignore()
+            self.hide()
 
 
 class RealTimeViewer(QMainWindow):
@@ -1725,6 +1731,11 @@ class RealTimeViewer(QMainWindow):
         self._last_trigger_t = None
         self.separate = False
         self._magstim_mode = "SM"
+        self._fro_single_pending = False
+        self._fro_firing = False
+        self._fro_last_config = None
+        self._fro_bounced = False
+        self._com_thread_stop = threading.Event()
         self._magstim_port = None
         self._magstim_stop = threading.Event()
         self._magstim_last_poll_t = 0.0
@@ -1790,6 +1801,14 @@ class RealTimeViewer(QMainWindow):
         self.lbl_magstim_status.setFont(_sf)
         self.lbl_magstim_status.setStyleSheet("color: #aaaaaa;")
         status_row.addWidget(self.lbl_magstim_status, stretch=1)
+
+        self.lbl_triggerbox_status = QLabel("TriggerBox: Not connected")
+        self.lbl_triggerbox_status.setAlignment(Qt.AlignCenter)
+        self.lbl_triggerbox_status.setFont(_sf)
+        self.lbl_triggerbox_status.setStyleSheet("color: #aaaaaa;")
+        self.lbl_triggerbox_status.setVisible(False)
+        status_row.addWidget(self.lbl_triggerbox_status, stretch=1)
+
         root.addLayout(status_row)
 
         root.addLayout(self._make_btn_row())
@@ -1906,7 +1925,7 @@ class RealTimeViewer(QMainWindow):
 
         self.radio_none = QRadioButton("None")
         self.radio_mep  = QRadioButton("rMT")
-        self.radio_sici = QRadioButton("SICI")
+        self.radio_sici = QRadioButton("Paired-Pulse (FRO)")
         self.radio_mep.setChecked(True)
         self.radio_none.setEnabled(False)
         self.radio_mep.setEnabled(False)
@@ -1917,13 +1936,21 @@ class RealTimeViewer(QMainWindow):
         analysis_group.addButton(self.radio_sici)
         self.radio_mep.toggled.connect(self._on_analysis_mode_changed)
         self.radio_sici.toggled.connect(self._on_analysis_mode_changed)
+        self._btn_setup_guide = QPushButton("SETUP-GUIDE")
+        self._btn_setup_guide.setStyleSheet(
+            "QPushButton { background-color: #c62828; color: white; font-weight: bold; }"
+            "QPushButton:hover { background-color: #b71c1c; }"
+            "QPushButton:pressed { background-color: #7f0000; }"
+        )
+        self._btn_setup_guide.setFixedHeight(int(self._btn_setup_guide.sizeHint().height() * 0.9))
+        self._btn_setup_guide.setVisible(False)
+        self._btn_setup_guide.clicked.connect(self._on_setup_guide_clicked)
+
         analysis_row.addWidget(self.radio_none)
         analysis_row.addWidget(self.radio_mep)
         analysis_row.addWidget(self.radio_sici)
+        analysis_row.addWidget(self._btn_setup_guide)
 
-        self._lbl_sici_msg = QLabel("Please switch TMS machine to Independent Triggering Mode.")
-        self._lbl_sici_msg.setVisible(False)
-        analysis_row.addWidget(self._lbl_sici_msg)
         analysis_row.addStretch()
 
         self.stack_analysis = _MaxSizeStack()
@@ -2143,12 +2170,12 @@ class RealTimeViewer(QMainWindow):
 
         sici_font = QFont(); sici_font.setPointSize(12)
 
-        btn_single = QPushButton("Single Pulse")
-        btn_single.setFont(sici_font)
-        btn_single.clicked.connect(self._on_single_pulse_clicked)
-        btn_double = QPushButton("Double Pulse")
-        btn_double.setFont(sici_font)
-        btn_double.clicked.connect(self._on_double_pulse_clicked)
+        self.btn_single = QPushButton("Single Pulse")
+        self.btn_single.setFont(sici_font)
+        self.btn_single.clicked.connect(self._on_single_pulse_clicked)
+        self.btn_double = QPushButton("Double Pulse")
+        self.btn_double.setFont(sici_font)
+        self.btn_double.clicked.connect(self._on_double_pulse_clicked)
 
         self._sici_isi_spin = QDoubleSpinBox()
         self._sici_isi_spin.setRange(0.1, 999.9)
@@ -2160,14 +2187,34 @@ class RealTimeViewer(QMainWindow):
         self._sici_isi_spin.setFixedWidth(80)
         self._sici_isi_spin.setFont(sici_font)
 
+        tb_btn_font = QFont(); tb_btn_font.setPointSize(11)
+        self.btn_triggerbox_connect = QPushButton("↺")
+        self.btn_triggerbox_connect.setFont(tb_btn_font)
+        self.btn_triggerbox_connect.setFixedWidth(28)
+        self.btn_triggerbox_connect.setToolTip("Trigger Box와 연결하기")
+        self.btn_triggerbox_connect.clicked.connect(self._on_triggerbox_btn_clicked)
+
+        self._lbl_fro_countdown = QLabel("")
+        self._lbl_fro_countdown.setFont(sici_font)
+        self._lbl_fro_countdown.setFixedWidth(36)
+        self._lbl_fro_countdown.setAlignment(Qt.AlignCenter)
+        self._lbl_fro_countdown.setStyleSheet("color: #e65100; font-weight: bold;")
+
+        self._fro_countdown_timer = QTimer(self)
+        self._fro_countdown_timer.setInterval(1000)
+        self._fro_countdown_timer.timeout.connect(self._tick_fro_countdown)
+        self._fro_countdown_val = 0
+
         sici_row.addSpacing(81)
-        sici_row.addWidget(btn_single)
-        sici_row.addWidget(btn_double)
+        sici_row.addWidget(self.btn_triggerbox_connect)
+        sici_row.addWidget(self.btn_single)
+        sici_row.addWidget(self.btn_double)
         sici_row.addSpacing(12)
         lbl_isi_sici = QLabel("ISI (ms):")
         lbl_isi_sici.setFont(sici_font)
         sici_row.addWidget(lbl_isi_sici)
         sici_row.addWidget(self._sici_isi_spin)
+        sici_row.addWidget(self._lbl_fro_countdown)
         sici_row.addStretch()
 
         # Stack hunt and sici rows in the same vertical space
@@ -2346,7 +2393,7 @@ class RealTimeViewer(QMainWindow):
         self._plot_window.activateWindow()
 
     def _on_active_clicked(self):
-        if self._active_window is None or not self._active_window.isVisible():
+        if self._active_window is None:
             self._active_window = ActiveWindow(self)
         self._active_window.populate_ch_combos()
         self._active_window.show()
@@ -2396,6 +2443,9 @@ class RealTimeViewer(QMainWindow):
         if msg.exec_() != QMessageBox.Yes:
             return
 
+        self._do_clear_all()
+
+    def _do_clear_all(self):
         if self.is_running:
             self._stop()
 
@@ -2589,7 +2639,6 @@ class RealTimeViewer(QMainWindow):
         self.widget_scope_params.setVisible(not chart)
         self.trigger_spin.setEnabled(not chart)
 
-        self.radio_none.setEnabled(not chart)
         self.radio_mep.setEnabled(not chart)
         self.radio_sici.setEnabled(not chart)
         mep_active = (not chart) and self.radio_mep.isChecked()
@@ -2615,7 +2664,32 @@ class RealTimeViewer(QMainWindow):
         is_sici = self.radio_sici.isChecked()
         is_any  = is_rmt or is_sici
 
-        self._lbl_sici_msg.setVisible(is_sici)
+        def _has_data():
+            return (any(s.table.rowCount() > 0 for s in (self.L, self.R))
+                    or bool(self.trigger_times))
+
+        if (is_sici or is_rmt) and _has_data():
+            from PyQt5.QtWidgets import QMessageBox
+            target = "Paired-Pulse (FRO)" if is_sici else "rMT"
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Switch Mode")
+            msg.setText(f"Switching to {target} mode will clear all current session data.")
+            msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+            msg.button(QMessageBox.Cancel).setText("Return")
+            msg.setDefaultButton(QMessageBox.Cancel)
+            if msg.exec_() != QMessageBox.Ok:
+                self.radio_mep.blockSignals(True)
+                self.radio_sici.blockSignals(True)
+                if is_sici:
+                    self.radio_mep.setChecked(True)
+                else:
+                    self.radio_sici.setChecked(True)
+                self.radio_mep.blockSignals(False)
+                self.radio_sici.blockSignals(False)
+                return
+            self._do_clear_all()
+
+        self._btn_setup_guide.setVisible(is_sici)
         self.widget_mep_params.setEnabled(is_any)
 
         # Hunt row: visible only for rMT; SICI row: visible only for SICI
@@ -2623,6 +2697,16 @@ class RealTimeViewer(QMainWindow):
         self._sici_row_widget.setVisible(is_sici)
         for s in (self.L, self.R):
             s.hunt_panel.setEnabled(is_rmt)
+
+        # MAGIC / TriggerBox status toggle
+        self.btn_magstim_reconnect.setEnabled(not is_sici)
+        self.lbl_magstim_status.setVisible(not is_sici)
+        self.lbl_triggerbox_status.setVisible(is_sici)
+        if is_sici:
+            self._stop_com_thread()
+        else:
+            self._stop_triggerbox_retry()
+            self._register_com_events()
 
         # SICI constraints
         self.btn_sm.setEnabled(not is_sici)
@@ -2636,8 +2720,12 @@ class RealTimeViewer(QMainWindow):
         self.combo_best.setEnabled(sici_location_enabled)
 
         if is_sici:
+            if self.is_running:
+                self._stop()
             # Force DM mode
             self._on_dm_clicked()
+            # Auto-scan and connect TriggerBox
+            QTimer.singleShot(100, self._on_triggerbox_btn_clicked)
 
         if self.radio_scope.isChecked():
             self._update_scope([self.L.ch, self.R.ch])
@@ -2737,6 +2825,54 @@ class RealTimeViewer(QMainWindow):
         self.lbl_ipi.setStyleSheet("")
         self.spin_isi.setStyleSheet("")
 
+    def _on_setup_guide_clicked(self):
+        dlg = QDialog(self, Qt.Popup)
+        dlg.setFixedSize(520, 520)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "reference", "photo", "pic1.jpeg")
+        img_src = "file:///" + img_path.replace("\\", "/")
+
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setFrameShape(QFrame.NoFrame)
+        browser.setHtml(f"""
+<h3>Paired-Pulse (FRO) Mode</h3>
+<p>This mode allows TMSviewer to control TMS stimulation directly from the PC by sending TTL
+pulses via the Trigger Box (ch5). The signal chain is:</p>
+<p><b>PC &rarr; Trigger Box &rarr; PowerLab / LabChart &rarr; TMS</b></p>
+<p>LabChart registers the assigned stimulation command (Single Pulse or Paired Pulse with a
+configurable ISI) using Fast Response Output (FRO), then delivers TTL pulses through
+Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
+
+<hr>
+
+<h4>Hardware Setup</h4>
+<p>Set the BiStim to <b>BiStim mode</b> and enable <b>Independent Triggering Mode</b>.</p>
+
+<p><img src="{img_src}" width="360"></p>
+
+<p>In PowerLab...</p>
+<p><b>A. Conditioning &rarr; Testing pulse:</b><br>
+&nbsp;&nbsp;&nbsp;&nbsp;connect J BNC to Output 1, Y BNC to Output 2</p>
+<p><b>B. Testing &rarr; Conditioning pulse:</b><br>
+&nbsp;&nbsp;&nbsp;&nbsp;connect Y BNC to Output 1, J BNC to Output 2</p>
+
+<hr>
+
+<h4>&#9888; If you were using MAGIC in rMT mode</h4>
+<ol>
+  <li>Turn off the TMS machine, PowerLab, and LabChart.</li>
+  <li>Disengage all MAGIC-related cable setup.</li>
+  <li>Restart the TMS machine, PowerLab, and LabChart.</li>
+</ol>
+""")
+        layout.addWidget(browser)
+        dlg.exec_()
+
     # ------------------------------------------------------------------
     # FRO helpers (SICI Single/Double Pulse)
     # ------------------------------------------------------------------
@@ -2816,6 +2952,80 @@ class RealTimeViewer(QMainWindow):
             self._triggerbox_port = None
             return False
 
+    def _on_triggerbox_btn_clicked(self):
+        if not _SERIAL_AVAILABLE:
+            self.lbl_triggerbox_status.setText("TriggerBox: pyserial not installed")
+            self.lbl_triggerbox_status.setStyleSheet("color: #c62828;")
+            return
+
+        # Close any existing connection before rescanning
+        tb = getattr(self, "_triggerbox_port", None)
+        if tb and tb.is_open:
+            try:
+                tb.write(bytes([0]))
+                tb.flush()
+                tb.close()
+            except Exception:
+                pass
+        self._triggerbox_port = None
+
+        self.lbl_triggerbox_status.setText("⟳  Scanning COM ports for TriggerBox...")
+        self.lbl_triggerbox_status.setStyleSheet("color: #1565C0;")
+        self.btn_triggerbox_connect.setEnabled(False)
+        QApplication.processEvents()
+
+        found_port = None
+        for port_info in serial.tools.list_ports.comports():
+            desc = (port_info.description or "").lower()
+            mfr  = (port_info.manufacturer or "").lower()
+            if "brain products" in desc or "brain products" in mfr or "triggerbox" in desc:
+                found_port = port_info.device
+                break
+
+        # Fallback: try each port at 115200
+        if found_port is None:
+            for port_info in serial.tools.list_ports.comports():
+                try:
+                    s = serial.Serial(port_info.device, TRIGGERBOX_BAUD, timeout=0.1)
+                    s.write(bytes([0]))
+                    s.flush()
+                    s.close()
+                    found_port = port_info.device
+                    break
+                except Exception:
+                    continue
+
+        self.btn_triggerbox_connect.setEnabled(True)
+
+        if found_port:
+            try:
+                self._triggerbox_port = serial.Serial(found_port, TRIGGERBOX_BAUD, timeout=0.1)
+                self._triggerbox_port.write(bytes([0]))
+                self._triggerbox_port.flush()
+                self.lbl_triggerbox_status.setText(f"TriggerBox: Connected ({found_port})")
+                self.lbl_triggerbox_status.setStyleSheet("color: #2e7d32;")
+                self._stop_triggerbox_retry()
+                return
+            except Exception:
+                self.lbl_triggerbox_status.setText(f"TriggerBox: Failed to open {found_port} — retrying...")
+                self.lbl_triggerbox_status.setStyleSheet("color: #c62828;")
+        else:
+            self.lbl_triggerbox_status.setText("TriggerBox: Not found — retrying...")
+            self.lbl_triggerbox_status.setStyleSheet("color: #c62828;")
+
+        self._start_triggerbox_retry()
+
+    def _start_triggerbox_retry(self):
+        if not hasattr(self, "_triggerbox_retry_timer"):
+            self._triggerbox_retry_timer = QTimer(self)
+            self._triggerbox_retry_timer.timeout.connect(self._on_triggerbox_btn_clicked)
+        if not self._triggerbox_retry_timer.isActive():
+            self._triggerbox_retry_timer.start(3000)
+
+    def _stop_triggerbox_retry(self):
+        if hasattr(self, "_triggerbox_retry_timer"):
+            self._triggerbox_retry_timer.stop()
+
     def _fire_triggerbox(self):
         if not self._ensure_triggerbox():
             return
@@ -2826,6 +3036,12 @@ class RealTimeViewer(QMainWindow):
             QTimer.singleShot(TRIGGERBOX_PULSE_MS, self._reset_triggerbox)
         except Exception:
             pass
+        if self.radio_sici.isChecked():
+            t = getattr(self, '_fro_pending_trigger_t', None)
+            try:
+                self._register_trigger(t if t is not None else 0.0)
+            except Exception as e:
+                print(f"[FRO] register_trigger failed: {e}")
 
     def _reset_triggerbox(self):
         tb = getattr(self, "_triggerbox_port", None)
@@ -2836,35 +3052,96 @@ class RealTimeViewer(QMainWindow):
             except Exception:
                 pass
 
+    def _fro_firing_done(self):
+        self._fro_firing = False
+        if self.is_running:
+            self.data_timer.start(UPDATE_MS)
+
+    def _start_fro_countdown(self):
+        self._fro_countdown_val = 5
+        self._lbl_fro_countdown.setText("5")
+        self.btn_single.setEnabled(False)
+        self.btn_double.setEnabled(False)
+        self._fro_countdown_timer.start()
+
+    def _tick_fro_countdown(self):
+        self._fro_countdown_val -= 1
+        if self._fro_countdown_val <= 0:
+            self._fro_countdown_timer.stop()
+            self._lbl_fro_countdown.setText("")
+            self.btn_single.setEnabled(True)
+            self.btn_double.setEnabled(True)
+        else:
+            self._lbl_fro_countdown.setText(str(self._fro_countdown_val))
+
     def _on_single_pulse_clicked(self):
         if self.client is None:
             return
-        sp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "SinglePulse.vbs"))
-        if not sp_hex:
-            return
-        if self._FRO_TWO_STEP:
-            self.client.play_message(sp_hex)
-            time.sleep(0.05)
-        self.client.play_message(sp_hex)
-        time.sleep(0.05)
-        self._fire_triggerbox()
+        try:
+            self._fro_pending_trigger_t = self.client.current_time() + 0.2001
+        except Exception:
+            self._fro_pending_trigger_t = None
+        self._fro_single_pending = True
+        if self._fro_last_config != "SP":
+            sp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "SinglePulse.vbs"))
+            if not sp_hex:
+                return
+            self._fro_firing = True
+            self.data_timer.stop()
+            try:
+                self.client.play_message(sp_hex)
+                self._fro_last_config = "SP"
+            except Exception as e:
+                print(f"[SinglePulse] PlayMessage failed: {e}")
+                self._fro_firing = False
+                if self.is_running:
+                    self.data_timer.start(UPDATE_MS)
+                return
+        else:
+            self._fro_firing = True
+            self.data_timer.stop()
+        QTimer.singleShot(150, self._fire_triggerbox)
+        if self.is_running:
+            QTimer.singleShot(500, self._fro_firing_done)
+        else:
+            self._fro_firing = False
+        self._start_fro_countdown()
 
     def _on_double_pulse_clicked(self):
         if self.client is None:
             return
-        dp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "DoublePulse.vbs"))
-        if not dp_hex:
-            return
-        # Keep Output 1 at template delay (0.0501s); only modify Output 2 = 0.0501 + ISI
-        isi_s    = self._sici_isi_spin.value() / 1000.0
-        out2_s   = 0.0501 + isi_s
-        modified = self._set_fro_output_delay(dp_hex, 2, out2_s)
-        if self._FRO_TWO_STEP:
-            self.client.play_message(dp_hex)   # template restore
-            time.sleep(0.05)
-        self.client.play_message(modified)
-        time.sleep(0.05)
-        self._fire_triggerbox()
+        isi_s  = self._sici_isi_spin.value() / 1000.0
+        out2_s = 0.0501 + isi_s
+        config_key = f"DP_{out2_s:.4f}"
+        try:
+            self._fro_pending_trigger_t = self.client.current_time() + 0.2001
+        except Exception:
+            self._fro_pending_trigger_t = None
+        if self._fro_last_config != config_key:
+            dp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "DoublePulse.vbs"))
+            if not dp_hex:
+                return
+            modified = self._set_fro_output_delay(dp_hex, 2, out2_s)
+            self._fro_firing = True
+            self.data_timer.stop()
+            try:
+                self.client.play_message(modified)
+                self._fro_last_config = config_key
+            except Exception as e:
+                print(f"[DoublePulse] PlayMessage failed: {e}")
+                self._fro_firing = False
+                if self.is_running:
+                    self.data_timer.start(UPDATE_MS)
+                return
+        else:
+            self._fro_firing = True
+            self.data_timer.stop()
+        QTimer.singleShot(150, self._fire_triggerbox)
+        if self.is_running:
+            QTimer.singleShot(500, self._fro_firing_done)
+        else:
+            self._fro_firing = False
+        self._start_fro_countdown()
 
     def _refresh_com_ports(self):
         pass  # combo removed; port stored in _magstim_selected_port
@@ -3031,6 +3308,7 @@ class RealTimeViewer(QMainWindow):
         if self._plot_window is not None:
             self._plot_window.close()
         if self._active_window is not None:
+            self._active_window._force_close = True
             self._active_window.close()
         super().closeEvent(event)
 
@@ -3090,9 +3368,17 @@ class RealTimeViewer(QMainWindow):
     def _register_com_events(self):
         if self._com_thread is not None and self._com_thread.is_alive():
             return
+        self._com_thread_stop.clear()
         self._com_thread = threading.Thread(target=self._com_thread_func, daemon=True)
         self._com_thread.start()
         print("[COM events] background thread started")
+
+    def _stop_com_thread(self):
+        if self._com_thread is not None and self._com_thread.is_alive():
+            self._com_thread_stop.set()
+            self._com_thread.join(timeout=0.5)
+            self._com_thread = None
+            print("[COM events] background thread stopped")
 
     def _com_thread_func(self):
         """Background thread: independent LabChart connection, pumps COM events."""
@@ -3112,9 +3398,11 @@ class RealTimeViewer(QMainWindow):
             doc = lc_app.ActiveDocument
             win32com.client.WithEvents(doc, _Sink)
             print("[COM thread] OnCommentAdded registered")
-            while True:
-                pythoncom.PumpWaitingMessages()
+            while not self._com_thread_stop.is_set():
+                if not self._fro_firing:
+                    pythoncom.PumpWaitingMessages()
                 time.sleep(0.05)
+            print("[COM thread] stopped cleanly")
         except Exception as e:
             print(f"[COM thread] exiting: {e}")
         finally:
@@ -3123,6 +3411,8 @@ class RealTimeViewer(QMainWindow):
     def _on_tms_trigger(self, event_args=()):
         if self.client is None:
             return
+        if self.radio_sici.isChecked():
+            return  # FRO mode: trigger registered directly via Sample button
         try:
             # OnCommentAdded args: (text, channel, record, tick)
             if len(event_args) >= 4:
@@ -3239,7 +3529,12 @@ class RealTimeViewer(QMainWindow):
         self._start_time = time.monotonic()
         self.is_running = True
         self.btn.setText("⏹  Stop")
-        if self._first_play:
+        if self.radio_sici.isChecked():
+            self._on_triggerbox_btn_clicked()
+        if self.radio_sici.isChecked():
+            self._first_play = False
+            self._fro_preload()
+        elif self._first_play:
             self._first_play = False
             try:
                 self.client.start_sampling()
@@ -3248,6 +3543,70 @@ class RealTimeViewer(QMainWindow):
             QTimer.singleShot(500, self._bounce_stop)
         else:
             self._do_start()
+
+    def _fro_preload(self):
+        """Send SP + DP PlayMessages BEFORE sampling starts to prime PowerLab FRO."""
+        self.btn_single.setEnabled(False)
+        self.btn_double.setEnabled(False)
+        sp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "SinglePulse.vbs"))
+        if sp_hex:
+            try:
+                self.client.play_message(sp_hex)
+                self._fro_last_config = "SP"
+                print("[FRO preload] SP sent")
+            except Exception as e:
+                print(f"[FRO preload] SP failed: {e}")
+        QTimer.singleShot(300, self._fro_preload_dp)
+
+    def _fro_preload_dp(self):
+        if self.client is None:
+            self._fro_preload_done()
+            return
+        dp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "DoublePulse.vbs"))
+        if dp_hex:
+            isi_s  = self._sici_isi_spin.value() / 1000.0
+            out2_s = 0.0501 + isi_s
+            modified = self._set_fro_output_delay(dp_hex, 2, out2_s)
+            try:
+                self.client.play_message(modified)
+                self._fro_last_config = f"DP_{out2_s:.4f}"
+                print("[FRO preload] DP sent")
+            except Exception as e:
+                print(f"[FRO preload] DP failed: {e}")
+        QTimer.singleShot(300, self._fro_preload_done)
+
+    def _fro_preload_done(self):
+        print("[FRO preload] complete — starting sampling")
+        try:
+            self.client.start_sampling()
+        except Exception as e:
+            print(f"[StartSampling] {e}")
+        self._start_time = time.monotonic()
+
+        if not self._fro_bounced:
+            # First pass: auto-bounce to initialize PowerLab FRO
+            self._fro_last_config = None
+            QTimer.singleShot(500, self._fro_auto_bounce)
+        else:
+            # Second pass: fully initialized
+            self._fro_bounced = False
+            self.btn_single.setEnabled(True)
+            self.btn_double.setEnabled(True)
+            self.data_timer.start(UPDATE_MS)
+
+    def _fro_auto_bounce(self):
+        if self.client is None:
+            self.btn_single.setEnabled(True)
+            self.btn_double.setEnabled(True)
+            self.data_timer.start(UPDATE_MS)
+            return
+        print("[FRO auto-bounce] stop → restart")
+        try:
+            self.client.stop_sampling()
+        except Exception as e:
+            print(f"[FRO auto-bounce] stop failed: {e}")
+        self._fro_bounced = True
+        QTimer.singleShot(300, self._fro_preload)
 
     def _bounce_stop(self):
         try:
@@ -3268,6 +3627,48 @@ class RealTimeViewer(QMainWindow):
         self.btn.setText("⏹  Stop")
         self.data_timer.start(UPDATE_MS)
 
+    def _fro_warmup(self):
+        self.btn_single.setEnabled(False)
+        self.btn_double.setEnabled(False)
+        QTimer.singleShot(500, self._fro_warmup_sp)
+
+    def _fro_warmup_sp(self):
+        if self.client is None:
+            self._fro_warmup_done()
+            return
+        sp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "SinglePulse.vbs"))
+        if sp_hex:
+            try:
+                self.client.play_message(sp_hex)
+                self._fro_last_config = "SP"
+                print("[FRO warmup] SP sent")
+            except Exception as e:
+                print(f"[FRO warmup] SP failed: {e}")
+        QTimer.singleShot(300, self._fro_warmup_dp)
+
+    def _fro_warmup_dp(self):
+        if self.client is None:
+            self._fro_warmup_done()
+            return
+        dp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "DoublePulse.vbs"))
+        if dp_hex:
+            isi_s  = self._sici_isi_spin.value() / 1000.0
+            out2_s = 0.0501 + isi_s
+            modified = self._set_fro_output_delay(dp_hex, 2, out2_s)
+            try:
+                self.client.play_message(modified)
+                self._fro_last_config = f"DP_{out2_s:.4f}"
+                print("[FRO warmup] DP sent")
+            except Exception as e:
+                print(f"[FRO warmup] DP failed: {e}")
+        QTimer.singleShot(300, self._fro_warmup_done)
+
+    def _fro_warmup_done(self):
+        self.btn_single.setEnabled(True)
+        self.btn_double.setEnabled(True)
+        self.data_timer.start(UPDATE_MS)
+        print("[FRO warmup] complete")
+
     def _stop(self):
         self.data_timer.stop()
         if self.client is not None:
@@ -3276,10 +3677,20 @@ class RealTimeViewer(QMainWindow):
             except Exception as e:
                 print(f"[StopSampling] {e}")
         self.is_running = False
+        self._fro_last_config = None
+        self._fro_bounced = False
         self.btn.setText("▶  Play")
 
     def _add_sample_comment(self):
         if self.client is None:
+            return
+        if self.radio_sici.isChecked():
+            # FRO mode: COM thread is paused, register trigger directly
+            try:
+                self.client.add_comment("Trigger")
+            except Exception:
+                pass
+            self._register_trigger(self.client.current_time())
             return
         try:
             self.client.add_comment("Trigger")
@@ -3309,7 +3720,9 @@ class RealTimeViewer(QMainWindow):
             s.hunt_latest_eval  = False
             s.table_latest_eval = False
         loc_id   = self.spin_location.value()
-        mso2_str = str(self.spin_mso2.value()) if self._magstim_mode == "DM" else "0"
+        _single_pulse = self._fro_single_pending
+        self._fro_single_pending = False
+        mso2_str = "0" if _single_pulse else (str(self.spin_mso2.value()) if self._magstim_mode == "DM" else "0")
         isi_str  = f"{self.spin_isi.value():.1f}" if self._magstim_mode == "DM" else "0"
         row_vals = [
             lambda s: str(trial_num),
@@ -3548,7 +3961,10 @@ class RealTimeViewer(QMainWindow):
         valid = arr[mask]
         if len(valid) == 0:
             return None
-        return float(valid.min()), float(valid.max())
+        ymin, ymax = float(np.nanmin(valid)), float(np.nanmax(valid))
+        if not (np.isfinite(ymin) and np.isfinite(ymax)):
+            return None
+        return ymin, ymax
 
     @staticmethod
     def _draw(curve, arr, t_start, t_end, offset=0, t_scale=1.0):
