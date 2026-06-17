@@ -238,6 +238,19 @@ def test_decode_only():
             print(f"    error: {e}")
 
 
+def test_read_comments(doc):
+    """Test reading comment timestamps from LabChart COM API."""
+    print("\n--- Test 7: Read comments from LabChart ---")
+    if doc is None:
+        print("  [labchart] not connected")
+        return
+    try:
+        attrs = [a for a in dir(doc) if "omment" in a or "Comment" in a]
+        print(f"  Comment-related attributes: {attrs}")
+    except Exception as e:
+        print(f"  dir() error: {e}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def start_sampling(doc):
@@ -277,6 +290,7 @@ Options:
   6  Alternate Single/Double (reproduce disconnect bug)
   s  Start sampling (재생)
   x  Stop sampling (정지)
+  7  Read latest comments (comment timestamp test)
   q  Quit
 """
 
@@ -314,6 +328,8 @@ Options:
             test_alternate_single_double(doc, tb, n=n, isi_ms=isi, delay_s=sec)
         elif choice == "4":
             test_decode_only()
+        elif choice == "7":
+            test_read_comments(doc)
         else:
             print("  Unknown choice.")
 

@@ -2186,6 +2186,7 @@ class RealTimeViewer(QMainWindow):
         self._sici_isi_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self._sici_isi_spin.setFixedWidth(80)
         self._sici_isi_spin.setFont(sici_font)
+        self._sici_isi_spin.setToolTip("ISI: max 99 ms (hardware FRO limit)")
 
         tb_btn_font = QFont(); tb_btn_font.setPointSize(11)
         self.btn_triggerbox_connect = QPushButton("↺")
@@ -3036,12 +3037,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
             QTimer.singleShot(TRIGGERBOX_PULSE_MS, self._reset_triggerbox)
         except Exception:
             pass
-        if self.radio_sici.isChecked():
-            t = getattr(self, '_fro_pending_trigger_t', None)
-            try:
-                self._register_trigger(t if t is not None else 0.0)
-            except Exception as e:
-                print(f"[FRO] register_trigger failed: {e}")
+        # FRO mode: trigger time registered via OnCommentAdded (exact LabChart timestamp)
 
     def _reset_triggerbox(self):
         tb = getattr(self, "_triggerbox_port", None)
@@ -3411,8 +3407,6 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
     def _on_tms_trigger(self, event_args=()):
         if self.client is None:
             return
-        if self.radio_sici.isChecked():
-            return  # FRO mode: trigger registered directly via Sample button
         try:
             # OnCommentAdded args: (text, channel, record, tick)
             if len(event_args) >= 4:
@@ -3593,6 +3587,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
             self.btn_single.setEnabled(True)
             self.btn_double.setEnabled(True)
             self.data_timer.start(UPDATE_MS)
+            self._register_com_events()
 
     def _fro_auto_bounce(self):
         if self.client is None:
@@ -3671,6 +3666,8 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
 
     def _stop(self):
         self.data_timer.stop()
+        if self.radio_sici.isChecked():
+            self._stop_com_thread()
         if self.client is not None:
             try:
                 self.client.stop_sampling()
@@ -3862,7 +3859,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
 
         # Evaluate both sides once; reuse for display, hunt, and table
         is_latest = (selected_row == len(self.trigger_times) - 1)
-        if self.radio_mep.isChecked():
+        if self.radio_mep.isChecked() or self.radio_sici.isChecked():
             r_L = self._analyse_epoch(arr_L, second=False)
             r_R = self._analyse_epoch(arr_R, second=self.separate)
             self._update_stats(self.L.stats, arr_L, second=False)
@@ -3873,7 +3870,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
                 s.stats.setText("Prestim RMS\n—\n\nMEP amp\n—")
 
         # Hunt + table fill — latest trigger only, once
-        if is_latest and self.radio_mep.isChecked():
+        if is_latest and (self.radio_mep.isChecked() or self.radio_sici.isChecked()):
             for s, r in ((self.L, r_L), (self.R, r_R)):
                 if s.hunt_panel.isEnabled() and s.hunt_chk.isChecked() and not s.hunt_latest_eval and r is not None:
                     thr = (self.spin_threshold_2.value() if (s is self.R and self.separate)
@@ -3923,7 +3920,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
             s.plot.addItem(line)
             s.vlines.append(line)
 
-        if self.radio_mep.isChecked():
+        if self.radio_mep.isChecked() or self.radio_sici.isChecked():
             def _add_shades(s, pre_s_spin, pre_e_spin, mep_s_spin, mep_e_spin):
                 for a, b in (
                     (pre_s_spin.value() / 1000.0 * t_scale, pre_e_spin.value() / 1000.0 * t_scale),
