@@ -218,7 +218,7 @@ class ActiveWindow(QWidget):
         root.setSpacing(4)
 
         self.lbl_window_title = QLabel("Maximum Voluntary Contraction")
-        title_font = QFont(); title_font.setPointSize(11); title_font.setBold(True)
+        title_font = QFont(); title_font.setPointSize(16); title_font.setBold(True)
         self.lbl_window_title.setFont(title_font)
         self.lbl_window_title.setAlignment(Qt.AlignCenter)
         root.addWidget(self.lbl_window_title)
@@ -242,12 +242,14 @@ class ActiveWindow(QWidget):
 
         self.plot_left = pg.PlotWidget()
         self.plot_right = pg.PlotWidget()
+        _aw_tick_font = QFont(); _aw_tick_font.setPointSize(13)
         for plt in (self.plot_left, self.plot_right):
             plt.setBackground("k")
             plt.setXRange(0, 1)
             plt.setYRange(0, 1)
             plt.getAxis("bottom").hide()
             plt.getAxis("left").setTextPen("w")
+            plt.getAxis("left").setTickFont(_aw_tick_font)
             plt.showGrid(x=False, y=True, alpha=0.2)
             plt.setMouseEnabled(x=False, y=False)
 
@@ -322,23 +324,28 @@ class ActiveWindow(QWidget):
         arrow_font = QFont(); arrow_font.setPointSize(14); arrow_font.setBold(True)
         self.arrow_lbl.setFont(arrow_font)
 
+        mid_font = QFont(); mid_font.setPointSize(14)
         self.btn_switch = QPushButton("Switch")
-        self.btn_switch.setFixedWidth(90)
+        self.btn_switch.setFixedWidth(110)
+        self.btn_switch.setFont(mid_font)
         self.btn_switch.setToolTip(
             "Click: toggle left / right channel\n"
             "Shift + Click: both channels"
         )
         self.btn_switch.clicked.connect(self._on_switch_clicked)
         self.btn_mvc    = QPushButton("MVC")
-        self.btn_mvc.setFixedWidth(90)
+        self.btn_mvc.setFixedWidth(110)
+        self.btn_mvc.setFont(mid_font)
         self.btn_mvc.clicked.connect(self._on_mvc_clicked)
         dur_lbl = QLabel("Duration")
         dur_lbl.setAlignment(Qt.AlignCenter)
+        dur_lbl.setFont(mid_font)
         self.spin_duration = QSpinBox()
         self.spin_duration.setRange(0, 999)
         self.spin_duration.setValue(10)
         self.spin_duration.setSuffix(" s")
-        self.spin_duration.setFixedWidth(72)
+        self.spin_duration.setFixedWidth(90)
+        self.spin_duration.setFont(mid_font)
 
         self._lbl_yaxis_header = QLabel("Y axis  (<-)")
         self._lbl_yaxis_header.setAlignment(Qt.AlignCenter)
@@ -386,7 +393,7 @@ class ActiveWindow(QWidget):
         root.addLayout(main_row, stretch=1)
 
         # ── stats / avg rows ───────────────────────────────────────────────
-        stats_font = QFont(); stats_font.setPointSize(9)
+        stats_font = QFont(); stats_font.setPointSize(13)
         _sel = Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
         _REDO_W = 46
 
@@ -397,12 +404,39 @@ class ActiveWindow(QWidget):
             lbl.setTextInteractionFlags(_sel)
             return lbl
 
-        self.lbl_stats_left  = _stat_label("n= —    MAX: —    MIN: —")
-        self.lbl_stats_right = _stat_label("n= —    MAX: —    MIN: —")
         self._avg_max_left  = None
         self._avg_min_left  = None
         self._avg_max_right = None
         self._avg_min_right = None
+        self._trial_max_left  = None
+        self._trial_min_left  = None
+        self._trial_max_right = None
+        self._trial_min_right = None
+
+        _btn_trial_style = (
+            "QPushButton { border: 1px solid #444; border-radius: 3px; "
+            "padding: 1px 6px; background: #1e1e1e; color: #bbb; font-size: 13pt; }"
+            "QPushButton:hover { background: #2a2a2a; color: #fff; }"
+        )
+
+        def _trial_stat_side(n_attr, max_attr, min_attr):
+            lay = QHBoxLayout()
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(4)
+            lay.addStretch()
+            lbl_n = _stat_label("n= —")
+            setattr(self, n_attr, lbl_n)
+            lay.addWidget(lbl_n)
+            for attr, label in ((max_attr, "MAX: —"), (min_attr, "MIN: —")):
+                btn = QPushButton(label)
+                btn.setStyleSheet(_btn_trial_style)
+                btn.setFixedWidth(130)
+                btn.setToolTip("Click to copy value")
+                btn.clicked.connect(lambda checked=False, b=btn: self._copy_trial_btn(b))
+                setattr(self, attr, btn)
+                lay.addWidget(btn)
+            lay.addStretch()
+            return lay
 
         self.btn_redo_left  = QPushButton("Redo")
         self.btn_redo_right = QPushButton("Redo")
@@ -415,21 +449,21 @@ class ActiveWindow(QWidget):
         stats_row = QHBoxLayout()
         stats_row.setContentsMargins(0, 0, 0, 0)
         stats_row.setSpacing(4)
-        stats_row.addWidget(self.lbl_stats_left,  stretch=5)
+        stats_row.addLayout(_trial_stat_side("lbl_n_left",  "btn_trial_max_left",  "btn_trial_min_left"),  stretch=5)
         stats_row.addWidget(self.btn_redo_left)
         stats_row.addStretch(1)
         stats_row.addWidget(self.btn_redo_right)
-        stats_row.addWidget(self.lbl_stats_right, stretch=5)
+        stats_row.addLayout(_trial_stat_side("lbl_n_right", "btn_trial_max_right", "btn_trial_min_right"), stretch=5)
         root.addLayout(stats_row)
 
         _btn_avg_style = (
             "QPushButton { border: 1px solid #555; border-radius: 3px; "
-            "padding: 1px 6px; background: #252525; color: #ccc; font-size: 9pt; }"
+            "padding: 1px 6px; background: #252525; color: #ccc; font-size: 13pt; }"
             "QPushButton:hover { background: #333; color: #fff; }"
         )
         _edit_avg_style = (
             "QLineEdit { border: 1px solid #555; border-radius: 3px; "
-            "padding: 1px 4px; background: #1a1a1a; color: #eee; font-size: 9pt; }"
+            "padding: 1px 4px; background: #1a1a1a; color: #eee; font-size: 13pt; }"
         )
 
         def _avg_side_layout(max_btn_attr, max_edit_attr, min_btn_attr, min_edit_attr, side):
@@ -437,19 +471,22 @@ class ActiveWindow(QWidget):
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setSpacing(3)
             lay.addStretch()
+            lbl_avg = QLabel("avg:")
+            lbl_avg.setFont(stats_font)
+            lay.addWidget(lbl_avg)
             for btn_attr, edit_attr, kind in (
                 (max_btn_attr, max_edit_attr, "max"),
                 (min_btn_attr, min_edit_attr, "min"),
             ):
                 lbl_kind = "MAX" if kind == "max" else "MIN"
                 btn = QPushButton(lbl_kind)
-                btn.setFixedWidth(46)
+                btn.setFixedWidth(58)
                 btn.setStyleSheet(_btn_avg_style)
                 btn.setToolTip(f"Click to copy {lbl_kind} value")
                 edit = QLineEdit()
                 edit.setPlaceholderText("—")
                 edit.setStyleSheet(_edit_avg_style)
-                edit.setFixedWidth(72)
+                edit.setFixedWidth(86)
                 edit.setAlignment(Qt.AlignCenter)
                 btn.clicked.connect(lambda checked=False, e=edit: self._copy_edit(e))
                 setattr(self, btn_attr,  btn)
@@ -483,7 +520,7 @@ class ActiveWindow(QWidget):
         hold_row = QHBoxLayout()
         hold_row.setContentsMargins(0, 0, 0, 0)
         self.chk_hold_task = QCheckBox("Hold task")
-        hold_font = QFont(); hold_font.setPointSize(9); hold_font.setBold(True)
+        hold_font = QFont(); hold_font.setPointSize(13); hold_font.setBold(True)
         self.chk_hold_task.setFont(hold_font)
         self.chk_hold_task.setEnabled(False)
         self.chk_hold_task.toggled.connect(self._on_hold_task_toggled)
@@ -495,11 +532,11 @@ class ActiveWindow(QWidget):
         # ── Target row ─────────────────────────────────────────────────────
         _tgt_style = (
             "QDoubleSpinBox { border: 1px solid #555; border-radius: 3px; "
-            "padding: 1px 3px; background: #1a1a1a; color: #eee; font-size: 9pt; }"
+            "padding: 1px 3px; background: #1a1a1a; color: #eee; font-size: 13pt; }"
         )
         _tgt_btn_style = (
             "QPushButton { border: 1px solid #555; border-radius: 3px; "
-            "padding: 2px 8px; background: #252525; color: #ccc; font-size: 9pt; }"
+            "padding: 2px 8px; background: #252525; color: #ccc; font-size: 13pt; }"
             "QPushButton:hover { background: #333; color: #fff; }"
             "QPushButton:disabled { color: #555; background: #1a1a1a; }"
         )
@@ -512,9 +549,8 @@ class ActiveWindow(QWidget):
             spin_pct = QDoubleSpinBox()
             spin_pct.setRange(0.0, 200.0)
             spin_pct.setValue(50.0)
-            spin_pct.setDecimals(1)
-            spin_pct.setSuffix(" %")
-            spin_pct.setFixedWidth(68)
+            spin_pct.setDecimals(0)
+            spin_pct.setFixedWidth(84)
             spin_pct.setStyleSheet(_tgt_style)
             spin_pct.setButtonSymbols(QAbstractSpinBox.NoButtons)
             lbl_pm = QLabel("±")
@@ -522,13 +558,13 @@ class ActiveWindow(QWidget):
             spin_tol = QDoubleSpinBox()
             spin_tol.setRange(0.0, 100.0)
             spin_tol.setValue(10.0)
-            spin_tol.setDecimals(1)
+            spin_tol.setDecimals(0)
             spin_tol.setSuffix(" %")
-            spin_tol.setFixedWidth(62)
+            spin_tol.setFixedWidth(76)
             spin_tol.setStyleSheet(_tgt_style)
             spin_tol.setButtonSymbols(QAbstractSpinBox.NoButtons)
             btn = QPushButton("APPLY")
-            btn.setFixedWidth(68)
+            btn.setFixedWidth(84)
             btn.setStyleSheet(_tgt_btn_style)
             setattr(self, pct_attr, spin_pct)
             setattr(self, tol_attr, spin_tol)
@@ -549,7 +585,7 @@ class ActiveWindow(QWidget):
 
         lbl_targets = QLabel("targets")
         lbl_targets.setAlignment(Qt.AlignCenter)
-        lbl_targets_font = QFont(); lbl_targets_font.setPointSize(9)
+        lbl_targets_font = QFont(); lbl_targets_font.setPointSize(13)
         lbl_targets.setFont(lbl_targets_font)
 
         def _centered_col(widget):
@@ -567,6 +603,7 @@ class ActiveWindow(QWidget):
         target_row.addLayout(_centered_col(lbl_targets),            stretch=1)
         target_row.addLayout(_centered_col(self._tgt_widget_right), stretch=1)
         root.addLayout(target_row)
+        root.addSpacing(60)
 
     def populate_ch_combos(self):
         ch_info = getattr(self._viewer, "ch_info", None)
@@ -721,7 +758,7 @@ class ActiveWindow(QWidget):
         now = time.time()
         if self._task_end_t != float('inf'):
             secs_left = max(0.0, self._task_end_t - now)
-            self._set_countdown(f"{secs_left:.1f}")
+            self._set_countdown(f"{int(secs_left)}")
         else:
             self._set_countdown("")
 
@@ -874,8 +911,34 @@ class ActiveWindow(QWidget):
 
         s_l, amx_l, amn_l = _fmt(self._history_left,  self._cur_max_left,  self._cur_min_left)
         s_r, amx_r, amn_r = _fmt(self._history_right, self._cur_max_right, self._cur_min_right)
-        self.lbl_stats_left.setText(s_l)
-        self.lbl_stats_right.setText(s_r)
+
+        def _apply_trial_stats(n_lbl, max_btn, min_btn, fmt_str, max_val, min_val, max_attr, min_attr):
+            import re
+            m = re.match(r"(n=\S+)", fmt_str)
+            n_lbl.setText(m.group(1) if m else "n= —")
+            if max_val is not None:
+                max_btn.setText(f"MAX: {max_val:.4f}")
+                setattr(self, max_attr, max_val)
+            else:
+                max_btn.setText("MAX: —")
+                setattr(self, max_attr, None)
+            if min_val is not None:
+                min_btn.setText(f"MIN: {min_val:.4f}")
+                setattr(self, min_attr, min_val)
+            else:
+                min_btn.setText("MIN: —")
+                setattr(self, min_attr, None)
+
+        hist_l = self._history_left;  hist_r = self._history_right
+        mx_l = (self._cur_max_left  if self._streaming and self._cur_max_left  is not None else (hist_l[-1][0] if hist_l else None))
+        mn_l = (self._cur_min_left  if self._streaming and self._cur_min_left  is not None else (hist_l[-1][1] if hist_l else None))
+        mx_r = (self._cur_max_right if self._streaming and self._cur_max_right is not None else (hist_r[-1][0] if hist_r else None))
+        mn_r = (self._cur_min_right if self._streaming and self._cur_min_right is not None else (hist_r[-1][1] if hist_r else None))
+
+        _apply_trial_stats(self.lbl_n_left,  self.btn_trial_max_left,  self.btn_trial_min_left,
+                           s_l, mx_l, mn_l, "_trial_max_left",  "_trial_min_left")
+        _apply_trial_stats(self.lbl_n_right, self.btn_trial_max_right, self.btn_trial_min_right,
+                           s_r, mx_r, mn_r, "_trial_max_right", "_trial_min_right")
         self._avg_max_left  = amx_l
         self._avg_min_left  = amn_l
         self._avg_max_right = amx_r
@@ -894,6 +957,14 @@ class ActiveWindow(QWidget):
         text = edit_widget.text().strip()
         if text:
             QApplication.clipboard().setText(text)
+
+    def _copy_trial_btn(self, btn):
+        text = btn.text()  # e.g. "MAX: 0.1234"
+        parts = text.split(":")
+        if len(parts) == 2:
+            val = parts[1].strip()
+            if val and val != "—":
+                QApplication.clipboard().setText(val)
 
     def _check_hold_task_availability(self):
         has_l = bool(self.edit_avg_max_left.text().strip())
@@ -1103,15 +1174,20 @@ class PlotWindow(QWidget):
 
         self.canvas = pg.GraphicsLayoutWidget()
         self._plot_item = self.canvas.addPlot()
-        self._plot_item.setLabel("left",   "MEP amp")
-        self._plot_item.setLabel("bottom", "MSO1")
+        self._plot_item.setLabel("left",   "MEP amp",  **{"font-size": "13pt"})
+        self._plot_item.setLabel("bottom", "MSO1",     **{"font-size": "13pt"})
         self._plot_item.showGrid(x=True, y=True, alpha=0.3)
         self._plot_item.getAxis("bottom").setStyle(tickTextOffset=6)
         self._plot_item.getAxis("left").enableAutoSIPrefix(False)
+        _tick_font = QFont(); _tick_font.setPointSize(13)
+        self._plot_item.getAxis("bottom").setTickFont(_tick_font)
+        self._plot_item.getAxis("left").setTickFont(_tick_font)
         self._plot_item.scene().sigMouseMoved.connect(self._on_plot_mouse_moved)
         graph_row.addWidget(self.canvas, stretch=9)
 
+        _pw_font = QFont(); _pw_font.setPointSize(11)
         graph_btn_panel  = QWidget()
+        graph_btn_panel.setFont(_pw_font)
         graph_btn_layout = QVBoxLayout(graph_btn_panel)
         graph_btn_layout.setContentsMargins(2, 0, 2, 0)
         graph_btn_layout.setSpacing(4)
@@ -1137,6 +1213,7 @@ class PlotWindow(QWidget):
 
         # ── Legend bar (Y-axis controls left + channel colours centred) ────
         self._legend_bar = QWidget()
+        self._legend_bar.setFont(_pw_font)
         legend_row = QHBoxLayout(self._legend_bar)
         legend_row.setContentsMargins(4, 2, 4, 2)
         legend_row.setSpacing(8)
@@ -1215,10 +1292,12 @@ class PlotWindow(QWidget):
         btn_layout.setSpacing(4)
 
         self._btn_exclude = QPushButton("Exclude")
+        self._btn_exclude.setFont(_pw_font)
         self._btn_exclude.clicked.connect(self._on_exclude_clicked)
         btn_layout.addWidget(self._btn_exclude)
 
         btn_clear_excl = QPushButton("Excl.Clear")
+        btn_clear_excl.setFont(_pw_font)
         btn_clear_excl.clicked.connect(self._on_clear_excluded)
         btn_layout.addWidget(btn_clear_excl)
 
@@ -1226,6 +1305,7 @@ class PlotWindow(QWidget):
         bottom_row.addWidget(btn_panel, stretch=1)
 
         root.addWidget(bottom_area, stretch=1)
+        root.addSpacing(60)
 
     # ------------------------------------------------------------------
 
@@ -1596,7 +1676,7 @@ class PlotWindow(QWidget):
     def _on_y_changed(self, idx):
         name, col = self._PLOT_COLS[idx]
         self._y_col = col
-        self._plot_item.setLabel("left", name)
+        self._plot_item.setLabel("left", name, **{"font-size": "13pt"})
         self._update_axis_exclusion()
         self._on_yaxis_auto()
         self._refresh_plot()
@@ -1604,7 +1684,7 @@ class PlotWindow(QWidget):
     def _on_x_changed(self, idx):
         name, col = self._PLOT_COLS[idx]
         self._x_col = col
-        self._plot_item.setLabel("bottom", name)
+        self._plot_item.setLabel("bottom", name, **{"font-size": "13pt"})
         self._update_axis_exclusion()
         self._refresh_plot()
 
@@ -1781,7 +1861,6 @@ class RealTimeViewer(QMainWindow):
 
         root.addLayout(self._make_mode_row())
         root.addWidget(self._make_analysis_stack())
-        root.addLayout(self._make_channel_row())
         root.addLayout(self._make_plots_row(), stretch=1)
         root.addWidget(self._make_scope_below_stack())
 
@@ -1844,11 +1923,15 @@ class RealTimeViewer(QMainWindow):
     def _make_mode_row(self):
         mode_row = QHBoxLayout()
         mode_row.setSpacing(12)
+        _rf = QFont(); _rf.setPointSize(11)
 
-        mode_row.addWidget(QLabel("Mode:"))
+        _lbl_mode = QLabel("Mode:"); _lbl_mode.setFont(_rf)
+        mode_row.addWidget(_lbl_mode)
         self.radio_chart = QRadioButton("Chart")
+        self.radio_chart.setFont(_rf)
         self.radio_chart.setEnabled(False)
         self.radio_scope = QRadioButton("Scope")
+        self.radio_scope.setFont(_rf)
         self.radio_scope.setChecked(True)
         mode_group = QButtonGroup(self)
         mode_group.addButton(self.radio_chart)
@@ -1859,6 +1942,7 @@ class RealTimeViewer(QMainWindow):
         mode_row.addSpacing(20)
 
         self.widget_chart_params = QWidget()
+        self.widget_chart_params.setFont(_rf)
         chart_p = QHBoxLayout(self.widget_chart_params)
         chart_p.setContentsMargins(0, 0, 0, 0)
         chart_p.setSpacing(6)
@@ -1871,15 +1955,20 @@ class RealTimeViewer(QMainWindow):
         self.spinbox_window.setFixedWidth(63)
         chart_p.addWidget(self.spinbox_window)
         btn_chart_apply = QPushButton("Apply")
-        btn_chart_apply.setFixedWidth(50)
+        btn_chart_apply.setFixedWidth(60)
         btn_chart_apply.clicked.connect(self._apply_chart_params)
         chart_p.addWidget(btn_chart_apply)
         mode_row.addWidget(self.widget_chart_params)
 
         self.widget_scope_params = QWidget()
+        self.widget_scope_params.setFont(_rf)
         scope_p = QHBoxLayout(self.widget_scope_params)
         scope_p.setContentsMargins(0, 0, 0, 0)
         scope_p.setSpacing(6)
+        scope_p.addWidget(QLabel("Data window"))
+        self._lbl_scope_total = QLabel("—")
+        scope_p.addWidget(self._lbl_scope_total)
+        scope_p.addWidget(QLabel("="))
         scope_p.addWidget(QLabel("Pre:"))
         self.spin_pre = QDoubleSpinBox()
         self.spin_pre.setRange(0.1, 5.0)
@@ -1896,20 +1985,28 @@ class RealTimeViewer(QMainWindow):
         self.spin_post.setSuffix(" s")
         self.spin_post.setFixedWidth(63)
         scope_p.addWidget(self.spin_post)
+        def _upd_scope_total():
+            self._lbl_scope_total.setText(f"{self.spin_pre.value() + self.spin_post.value():.1f} s")
+        self.spin_pre.valueChanged.connect(lambda _: _upd_scope_total())
+        self.spin_post.valueChanged.connect(lambda _: _upd_scope_total())
+        _upd_scope_total()
         btn_scope_apply = QPushButton("Apply")
-        btn_scope_apply.setFixedWidth(50)
+        btn_scope_apply.setFixedWidth(60)
         btn_scope_apply.clicked.connect(self._apply_scope_params)
         scope_p.addWidget(btn_scope_apply)
         self.widget_scope_params.setVisible(False)
         mode_row.addWidget(self.widget_scope_params)
 
         mode_row.addSpacing(20)
-        mode_row.addWidget(QLabel("Paralysis:"))
+        _lbl_par = QLabel("Paralysis:"); _lbl_par.setFont(_rf)
+        mode_row.addWidget(_lbl_par)
         self._paralysis_combo = QComboBox()
+        self._paralysis_combo.setFont(_rf)
         self._paralysis_combo.addItems(["NA", "LEFT", "RIGHT"])
         mode_row.addWidget(self._paralysis_combo)
         mode_row.addSpacing(8)
         btn_active = QPushButton("Active")
+        btn_active.setFont(_rf)
         btn_active.setFixedWidth(70)
         btn_active.clicked.connect(self._on_active_clicked)
         mode_row.addWidget(btn_active)
@@ -1923,9 +2020,13 @@ class RealTimeViewer(QMainWindow):
         analysis_row.setContentsMargins(0, 0, 0, 0)
         analysis_row.setSpacing(12)
 
+        _af = QFont(); _af.setPointSize(11)
         self.radio_none = QRadioButton("None")
+        self.radio_none.setFont(_af)
         self.radio_mep  = QRadioButton("rMT")
+        self.radio_mep.setFont(_af)
         self.radio_sici = QRadioButton("Paired-Pulse (FRO)")
+        self.radio_sici.setFont(_af)
         self.radio_mep.setChecked(True)
         self.radio_none.setEnabled(False)
         self.radio_mep.setEnabled(False)
@@ -1959,18 +2060,27 @@ class RealTimeViewer(QMainWindow):
         return self.stack_analysis
 
     def _make_channel_row(self):
-        combos_row = QHBoxLayout()
-        combos_row.setSpacing(8)
         self.L.combo = QComboBox()
         self.R.combo = QComboBox()
         self.L.combo.currentIndexChanged.connect(lambda idx: self._on_combo("left",  idx))
         self.R.combo.currentIndexChanged.connect(lambda idx: self._on_combo("right", idx))
-        combos_row.addWidget(QLabel("Left channel:"))
-        combos_row.addWidget(self.L.combo, stretch=1)
-        combos_row.addSpacing(150)
-        combos_row.addWidget(QLabel("Right channel:"))
-        combos_row.addWidget(self.R.combo, stretch=1)
-        return combos_row
+        _cf = QFont(); _cf.setPointSize(11)
+
+        left_h = QHBoxLayout()
+        left_h.setSpacing(8)
+        _lbl_lch = QLabel("Left CH:"); _lbl_lch.setFont(_cf)
+        self.L.combo.setFont(_cf)
+        left_h.addWidget(_lbl_lch)
+        left_h.addWidget(self.L.combo, stretch=1)
+
+        right_h = QHBoxLayout()
+        right_h.setSpacing(8)
+        _lbl_rch = QLabel("Right CH:"); _lbl_rch.setFont(_cf)
+        self.R.combo.setFont(_cf)
+        right_h.addWidget(_lbl_rch)
+        right_h.addWidget(self.R.combo, stretch=1)
+
+        return left_h, right_h
 
     def _make_centre_column(self):
         self.centre_widget = QWidget()
@@ -1980,6 +2090,8 @@ class RealTimeViewer(QMainWindow):
 
         lbl_pages = QLabel("Trial #")
         lbl_pages.setAlignment(Qt.AlignCenter)
+        _lp_font = QFont(); _lp_font.setPointSize(11)
+        lbl_pages.setFont(_lp_font)
         self.trigger_spin = QSpinBox()
         self.trigger_spin.setRange(0, 9999)
         self.trigger_spin.setValue(0)
@@ -2005,11 +2117,14 @@ class RealTimeViewer(QMainWindow):
         centre.addWidget(self.widget_mep_params)
         centre.addSpacing(6)
 
+        _ccf = QFont(); _ccf.setPointSize(11)
         btn_reset = QPushButton("Reset")
+        btn_reset.setFont(_ccf)
         btn_reset.clicked.connect(self._reset_mep_params)
         centre.addWidget(btn_reset)
 
         self.btn_separate = QPushButton("Separate")
+        self.btn_separate.setFont(_ccf)
         self.btn_separate.setCheckable(True)
         self.btn_separate.toggled.connect(self._on_separate_toggled)
         centre.addWidget(self.btn_separate)
@@ -2046,14 +2161,34 @@ class RealTimeViewer(QMainWindow):
         self.stack_centre.addWidget(self._make_centre_column())
         self.stack_centre.addWidget(QWidget())
 
-        plots_row = QHBoxLayout()
-        plots_row.setSpacing(8)
-        plots_row.addWidget(self.L.panel)
-        plots_row.addWidget(self.L.plot,  stretch=1)
-        plots_row.addWidget(self.stack_centre)
-        plots_row.addWidget(self.R.plot,  stretch=1)
-        plots_row.addWidget(self.R.panel)
-        return plots_row
+        left_ch, right_ch = self._make_channel_row()
+
+        left_graph = QHBoxLayout()
+        left_graph.setSpacing(8)
+        left_graph.addWidget(self.L.panel)
+        left_graph.addWidget(self.L.plot, stretch=1)
+
+        left_col = QVBoxLayout()
+        left_col.setSpacing(4)
+        left_col.addLayout(left_ch)
+        left_col.addLayout(left_graph, stretch=1)
+
+        right_graph = QHBoxLayout()
+        right_graph.setSpacing(8)
+        right_graph.addWidget(self.R.plot, stretch=1)
+        right_graph.addWidget(self.R.panel)
+
+        right_col = QVBoxLayout()
+        right_col.setSpacing(4)
+        right_col.addLayout(right_ch)
+        right_col.addLayout(right_graph, stretch=1)
+
+        combined = QHBoxLayout()
+        combined.setSpacing(8)
+        combined.addLayout(left_col, stretch=1)
+        combined.addWidget(self.stack_centre)
+        combined.addLayout(right_col, stretch=1)
+        return combined
 
     def _make_mso_row(self):
         mso_row  = QHBoxLayout()
@@ -2144,6 +2279,11 @@ class RealTimeViewer(QMainWindow):
         self.combo_best = QComboBox(); self.combo_best.setFont(btn_font)
         self.combo_best.setMinimumWidth(180)
         mso_row.addWidget(self.combo_best)
+
+        self.spin_mso1.valueChanged.connect(self._reset_hunt_for_param_change)
+        self.spin_mso2.valueChanged.connect(self._reset_hunt_for_param_change)
+        self.spin_isi.valueChanged.connect(self._reset_hunt_for_param_change)
+        self.spin_location.valueChanged.connect(self._reset_hunt_for_param_change)
         return mso_row
 
     def _make_scope_below_stack(self):
@@ -2239,11 +2379,12 @@ class RealTimeViewer(QMainWindow):
         self.L.table = self._make_data_table()
         self.R.table = self._make_data_table()
 
-        btn_plot = QPushButton("Plot"); btn_plot.setFixedWidth(130)
+        _tbf = QFont(); _tbf.setPointSize(11)
+        btn_plot = QPushButton("Plot"); btn_plot.setFixedWidth(130); btn_plot.setFont(_tbf)
         btn_plot.clicked.connect(self._on_plot_clicked)
-        btn_save = QPushButton("Save"); btn_save.setFixedWidth(130)
+        btn_save = QPushButton("Save"); btn_save.setFixedWidth(130); btn_save.setFont(_tbf)
         btn_save.clicked.connect(self._save_tables)
-        btn_clear_all = QPushButton("Clear"); btn_clear_all.setFixedWidth(130)
+        btn_clear_all = QPushButton("Clear"); btn_clear_all.setFixedWidth(130); btn_clear_all.setFont(_tbf)
         btn_clear_all.clicked.connect(self._on_clear_all)
         centre_btns = QVBoxLayout()
         centre_btns.setSpacing(6)
@@ -2295,24 +2436,33 @@ class RealTimeViewer(QMainWindow):
         mp.setContentsMargins(0, 0, 0, 0)
         mp.setSpacing(3)
 
-        mep_start = QSpinBox();  mep_start.setRange(1, 500);   mep_start.setValue(10);  mep_start.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        mep_end   = QSpinBox();  mep_end.setRange(1, 500);     mep_end.setValue(50);    mep_end.setSuffix(" ms");   mep_end.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        _pf = QFont(); _pf.setPointSize(10)
+        _sh = 30
+        mep_start = QSpinBox();  mep_start.setRange(1, 500);   mep_start.setValue(10);  mep_start.setButtonSymbols(QAbstractSpinBox.NoButtons); mep_start.setFont(_pf); mep_start.setMinimumHeight(_sh)
+        mep_end   = QSpinBox();  mep_end.setRange(1, 500);     mep_end.setValue(50);    mep_end.setSuffix(" ms");   mep_end.setButtonSymbols(QAbstractSpinBox.NoButtons); mep_end.setFont(_pf); mep_end.setMinimumHeight(_sh)
         threshold = QDoubleSpinBox(); threshold.setRange(0.01, 100); threshold.setSingleStep(0.01)
-        threshold.setDecimals(2); threshold.setValue(0.05); threshold.setSuffix(" mV"); threshold.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        prestim_start = QSpinBox(); prestim_start.setRange(-1000, -1); prestim_start.setValue(-150); prestim_start.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        prestim_end   = QSpinBox(); prestim_end.setRange(-500, -1);   prestim_end.setValue(-50); prestim_end.setSuffix(" ms"); prestim_end.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        threshold.setDecimals(2); threshold.setValue(0.05); threshold.setButtonSymbols(QAbstractSpinBox.NoButtons); threshold.setFont(_pf); threshold.setMinimumHeight(_sh)
+        prestim_start = QSpinBox(); prestim_start.setRange(-1000, -1); prestim_start.setValue(-150); prestim_start.setButtonSymbols(QAbstractSpinBox.NoButtons); prestim_start.setFont(_pf); prestim_start.setMinimumHeight(_sh)
+        prestim_end   = QSpinBox(); prestim_end.setRange(-500, -1);   prestim_end.setValue(-50); prestim_end.setButtonSymbols(QAbstractSpinBox.NoButtons); prestim_end.setFont(_pf); prestim_end.setMinimumHeight(_sh)
 
-        mp.addWidget(QLabel("MEP window"))
+        _lbl_mepw = QLabel("MEP window"); _lbl_mepw.setFont(_pf)
+        mp.addWidget(_lbl_mepw)
         mep_row = QHBoxLayout(); mep_row.setSpacing(3)
-        mep_row.addWidget(mep_start, stretch=1); mep_row.addWidget(QLabel("—")); mep_row.addWidget(mep_end, stretch=1)
+        _dash1 = QLabel("—"); _dash1.setFont(_pf)
+        mep_row.addWidget(mep_start, stretch=1); mep_row.addWidget(_dash1); mep_row.addWidget(mep_end, stretch=1)
         mp.addLayout(mep_row)
         mp.addSpacing(4)
-        mp.addWidget(QLabel("Threshold"))
-        mp.addWidget(threshold)
+        thr_row = QHBoxLayout(); thr_row.setSpacing(3)
+        _lbl_thr = QLabel("Thrsld"); _lbl_thr.setFont(_pf)
+        thr_row.addWidget(_lbl_thr)
+        thr_row.addWidget(threshold, stretch=1)
+        mp.addLayout(thr_row)
         mp.addSpacing(4)
-        mp.addWidget(QLabel("Prestim window"))
+        _lbl_prew = QLabel("Prestim"); _lbl_prew.setFont(_pf)
+        mp.addWidget(_lbl_prew)
         pre_row = QHBoxLayout(); pre_row.setSpacing(3)
-        pre_row.addWidget(prestim_start, stretch=1); pre_row.addWidget(QLabel("—")); pre_row.addWidget(prestim_end, stretch=1)
+        _dash2 = QLabel("—"); _dash2.setFont(_pf)
+        pre_row.addWidget(prestim_start, stretch=1); pre_row.addWidget(_dash2); pre_row.addWidget(prestim_end, stretch=1)
         mp.addLayout(pre_row)
 
         if second:
@@ -2487,7 +2637,7 @@ class RealTimeViewer(QMainWindow):
     def _make_side_panel(self, side):
         """Returns (outer_widget, stats_label) — Y-zoom controls + MEP/RMS stats."""
         outer = QWidget()
-        outer.setFixedWidth(88)
+        outer.setFixedWidth(110)
         vbox = QVBoxLayout(outer)
         vbox.setContentsMargins(2, 4, 2, 0)
         vbox.setSpacing(3)
@@ -2497,7 +2647,7 @@ class RealTimeViewer(QMainWindow):
         btn_font.setBold(True)
 
         small_font = QFont()
-        small_font.setPointSize(9)
+        small_font.setPointSize(11)
 
         btn_plus  = QPushButton("+")
         btn_minus = QPushButton("−")
@@ -2764,6 +2914,14 @@ class RealTimeViewer(QMainWindow):
         hand_side = "LEFT" if hand == "LH" else "RIGHT"
         return "PH" if hand_side == ph_side else "NPH"
 
+    def _reset_hunt_for_param_change(self):
+        for s in (self.L, self.R):
+            if s.hunt_panel.isEnabled() and s.hunt_chk.isChecked():
+                s.hunt_num = 0; s.hunt_den = 0
+                s.hunt_history.clear()
+                s.hunt_latest_eval = True
+                self._update_hunt_display("left" if s is self.L else "right")
+
     def _on_hunt_clear(self, side):
         targets = (self.L, self.R) if self._both_hunt_active() else (self.L if side == "left" else self.R,)
         for s in targets:
@@ -2881,7 +3039,11 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
     def _load_vbs_hex(self, rel_path):
         """Extract PlayMessage hex string from a .vbs file."""
         import re
-        base = os.path.dirname(os.path.abspath(__file__))
+        import sys
+        if getattr(sys, 'frozen', False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
         path = os.path.join(base, rel_path)
         try:
             with open(path, "r") as f:
@@ -3079,7 +3241,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
             self._fro_pending_trigger_t = None
         self._fro_single_pending = True
         if self._fro_last_config != "SP":
-            sp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "SinglePulse.vbs"))
+            sp_hex = self._load_vbs_hex(os.path.join("FRO", "SinglePulse.vbs"))
             if not sp_hex:
                 return
             self._fro_firing = True
@@ -3114,7 +3276,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
         except Exception:
             self._fro_pending_trigger_t = None
         if self._fro_last_config != config_key:
-            dp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "DoublePulse.vbs"))
+            dp_hex = self._load_vbs_hex(os.path.join("FRO", "DoublePulse.vbs"))
             if not dp_hex:
                 return
             modified = self._set_fro_output_delay(dp_hex, 2, out2_s)
@@ -3318,11 +3480,11 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
 
     def _reset_mep_params(self):
         for s, v in ((self.spin_mep_start, 10), (self.spin_mep_end, 50),
-                     (self.spin_threshold, 0.05), (self.spin_prestim_start, -200),
+                     (self.spin_threshold, 0.05), (self.spin_prestim_start, -150),
                      (self.spin_prestim_end, -50)):
             s.setValue(v)
         for s, v in ((self.spin_mep_start_2, 10), (self.spin_mep_end_2, 50),
-                     (self.spin_threshold_2, 0.05), (self.spin_prestim_start_2, -200),
+                     (self.spin_threshold_2, 0.05), (self.spin_prestim_start_2, -150),
                      (self.spin_prestim_end_2, -50)):
             s.setValue(v)
 
@@ -3542,7 +3704,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
         """Send SP + DP PlayMessages BEFORE sampling starts to prime PowerLab FRO."""
         self.btn_single.setEnabled(False)
         self.btn_double.setEnabled(False)
-        sp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "SinglePulse.vbs"))
+        sp_hex = self._load_vbs_hex(os.path.join("FRO", "SinglePulse.vbs"))
         if sp_hex:
             try:
                 self.client.play_message(sp_hex)
@@ -3556,7 +3718,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
         if self.client is None:
             self._fro_preload_done()
             return
-        dp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "DoublePulse.vbs"))
+        dp_hex = self._load_vbs_hex(os.path.join("FRO", "DoublePulse.vbs"))
         if dp_hex:
             isi_s  = self._sici_isi_spin.value() / 1000.0
             out2_s = 0.0501 + isi_s
@@ -3631,7 +3793,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
         if self.client is None:
             self._fro_warmup_done()
             return
-        sp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "SinglePulse.vbs"))
+        sp_hex = self._load_vbs_hex(os.path.join("FRO", "SinglePulse.vbs"))
         if sp_hex:
             try:
                 self.client.play_message(sp_hex)
@@ -3645,7 +3807,7 @@ Output 1 and Output 2. The TMS receives these signals and fires accordingly.</p>
         if self.client is None:
             self._fro_warmup_done()
             return
-        dp_hex = self._load_vbs_hex(os.path.join("reference", "FRO", "DoublePulse.vbs"))
+        dp_hex = self._load_vbs_hex(os.path.join("FRO", "DoublePulse.vbs"))
         if dp_hex:
             isi_s  = self._sici_isi_spin.value() / 1000.0
             out2_s = 0.0501 + isi_s
